@@ -11,7 +11,7 @@ Rust LSP binary for the `~/wiki` Typst-based Zettelkasten.
 ```bash
 cargo build          # dev build
 cargo build --release
-cargo test           # 29 tests across parser, formatting, migrate, reconcile
+cargo test           # 39 tests across parser, formatting, migrate, reconcile, cycle
 cargo test <name>    # run a single test by name (substring match)
 ```
 
@@ -26,6 +26,7 @@ zk-lsp new [--wiki-root PATH]       # create note, print path
 zk-lsp remove <ID> [--wiki-root PATH]  # delete note + remove from link.typ
 zk-lsp format                       # read note from stdin, write formatted to stdout
 zk-lsp migrate [--wiki-root PATH]   # migrate legacy comment-format notes to TOML schema v1
+zk-lsp reconcile [--wiki-root PATH] [--dry-run]  # reconcile cross-file checkbox states
 ```
 
 `WIKI_ROOT` env overrides the `~/wiki` default. `--wiki-root` overrides `WIKI_ROOT`.
@@ -89,19 +90,22 @@ These files are authoritative for behaviour parity:
 
 ```
 src/
-├── main.rs          CLI dispatch + LSP server startup
-├── cli.rs           clap CLI definitions
-├── config.rs        WikiConfig resolution
-├── parser.rs        Stateless note parsing (unit-tested)
-├── index.rs         NoteIndex (DashMap notes + backlinks)
-├── link_gen.rs      link.typ generation and entry management
-├── migrate.rs       migrate_wiki / migrate_note (legacy → TOML v1)
-├── note_ops.rs      create_note / delete_note
-├── server.rs        tower-lsp LanguageServer impl
-├── watcher.rs       notify-debouncer-mini (300 ms) on note_dir
+├── main.rs               CLI dispatch + LSP server startup
+├── cli.rs                clap CLI definitions
+├── config.rs             WikiConfig resolution
+├── parser.rs             Stateless note parsing (unit-tested)
+├── dependency_graph.rs   build_dependency_graph: RefItem → positioned edge list
+├── cycle.rs              detect_cycles (Tarjan SCC) + render_cycle_errors (CLI)
+├── reconcile.rs          single-pass DAG eval + batch write-back; fails on cycles
+├── index.rs              NoteIndex (DashMap notes + backlinks)
+├── link_gen.rs           link.typ generation and entry management
+├── migrate.rs            migrate_wiki / migrate_note (legacy → TOML v1)
+├── note_ops.rs           create_note / delete_note
+├── server.rs             tower-lsp LanguageServer impl
+├── watcher.rs            notify-debouncer-mini (300 ms) on note_dir
 └── handlers/
     ├── references.rs    find_references (uses backlink index)
-    ├── diagnostics.rs   archived → Warning, legacy → Info (with suppression)
+    ├── diagnostics.rs   archived → Warning, legacy → Info; get_cycle_diagnostics
     ├── code_actions.rs  replace + append quick-fixes
     ├── inlay_hints.rs   @ID → title after cursor
     └── formatting.rs    willSaveWaitUntil tag edit + cross-file propagation
@@ -122,7 +126,9 @@ vim.lsp.config("zk-lsp", {
 Two item types exist in checklists:
 
 1. **`LocalItem`** — truth = `item.checked` (source fact; user-authored)
-2. **`RefItem`** (`- [ ] @A @B …`) — truth = `∀ id ∈ target_ids: done_lookup(id)` (all referenced notes must be done; **never** the rendered checkbox)
+2. **`RefItem`** (`- [ ] @A @B …`) — truth = `∀ t ∈ targets: done_lookup(t.target_id)` (all referenced notes must be done; **never** the rendered checkbox)
+
+**`RefTarget`** carries `target_id`, `byte_start`, `byte_end` (byte offsets of `@ID` within the full line). Used by `dependency_graph` for positioned error reporting and by LSP diagnostics via `byte_to_utf16`.
 
 **Leaf items rule:** Only leaf items participate in note status aggregation. A leaf has no subsequent item with strictly greater indent. Non-leaf LocalItems are derived display views of their children and must not be used as source facts.
 
@@ -136,13 +142,17 @@ note.done = ∀ leaf_item ∈ items: eval_item_truth(leaf_item) == true
 
 **Responsibility split:**
 - **Formatter** (`formatting.rs`): current-file normalization + read-only dep_states lookup (trusts reconciled metadata via `is_note_done`); no graph solving. `is_note_done_with_deps` is the canonical semantic evaluator.
-- **Reconcile** (`reconcile.rs`): global SCC solve (Tarjan) + minimum fixed-point (start all-false, monotone false→true) + batch write-back. `compute_node_done` calls `is_note_done_with_deps` directly on raw content.
-- **Cycles** → SCC + minimum fixed point; pure cycles cannot become done without external support.
+- **Reconcile** (`reconcile.rs`): build dependency graph → detect cycles (fail fast) → Kahn topo-sort → single-pass DAG evaluation → batch write-back. No convergence loop.
+- **Cycles** — hard error. `detect_cycles` (Tarjan SCC) returns `Vec<DependencyCycle>`; CLI renders Typst-style errors with ANSI colour and CJK-aware `^` alignment; LSP emits per-file `ERROR` diagnostics via `get_cycle_diagnostics`.
 
-**Key functions in `src/parser.rs`:**
-- `parse_checklist_items(content)` → `Vec<ChecklistItem>` (skips fenced blocks)
-- `eval_item_truth(item, done_lookup)` → bool
-- `compute_note_done_from_items(items, done_lookup)` → bool (leaf-only)
+**Key functions:**
+- `parser::parse_checklist_items(content)` → `Vec<ChecklistItem>` (skips fenced blocks)
+- `parser::eval_item_truth(item, done_lookup)` → bool
+- `parser::compute_note_done_from_items(items, done_lookup)` → bool (leaf-only)
+- `dependency_graph::build_dependency_graph(notes)` → `DependencyGraph`
+- `cycle::detect_cycles(graph)` → `Vec<DependencyCycle>`
+- `cycle::render_cycle_errors(cycles)` → `String` (CLI; byte columns, ANSI colour, CJK width)
+- `diagnostics::get_cycle_diagnostics(content, path, cycles)` → `Vec<Diagnostic>` (LSP; UTF-16)
 
 ## Install
 
