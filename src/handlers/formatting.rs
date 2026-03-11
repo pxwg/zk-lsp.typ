@@ -7,7 +7,7 @@ use regex::Regex;
 use tower_lsp::lsp_types::*;
 
 use crate::index::NoteIndex;
-use crate::parser::{self, StatusTag};
+use crate::parser::{self, StatusTag, ChecklistStatus};
 
 static RE_TODO_ID: Lazy<Regex> = Lazy::new(|| Regex::new(r"@(\d{10})").unwrap());
 
@@ -44,15 +44,10 @@ pub async fn format_content(content: &str, note_dir: &Path) -> String {
 
 /// Returns true iff the note at `path` has an effective tag of `done`.
 ///
-/// "Effective" means: simulate what `apply_tag_edit` would produce, then read
-/// the resulting tag line.  This way the judgment is always based on the tag
-/// (not on raw todo counts), while still handling the case where the on-disk
-/// tag is stale.
-///
-/// Concretely:
-/// - If `compute_tag_edit` would change the tag line → use the new text.
-/// - If the tag line is already correct (no edit needed) → use the existing one.
-/// Either way we check for the literal string `#tag.done`.
+/// For TOML-format notes: derive done-ness from todo counts (same logic the
+/// formatter would apply when updating `checklist-status`).
+/// For legacy notes: simulate what `apply_tag_edit` would produce, then check
+/// for `#tag.done`.
 async fn ref_is_done(path: &Path) -> bool {
     let Ok(content) = tokio::fs::read_to_string(path).await else {
         return false;
@@ -60,9 +55,23 @@ async fn ref_is_done(path: &Path) -> bool {
     let Some(header) = parser::parse_header(&content) else {
         return false;
     };
+
+    if header.metadata_block.is_some() {
+        let todos = parser::count_todos(&content);
+        return match parser::compute_status_tag(&todos, header.archived) {
+            // Note has inline todos → status derived from them (same as compute_tag_edit)
+            Some(tag) => tag == StatusTag::Done,
+            // Note has no inline todos → checklist-status is the sole source of truth
+            None => header.checklist_status == Some(parser::ChecklistStatus::Done),
+        };
+    }
+
+    let Some(tag_line_idx) = header.tag_line_idx else {
+        return false;
+    };
     let lines: Vec<&str> = content.lines().collect();
     let existing = lines
-        .get(header.tag_line_idx)
+        .get(tag_line_idx)
         .copied()
         .unwrap_or("")
         .to_string();
@@ -174,13 +183,67 @@ fn update_nested_checkboxes(content: &str) -> String {
     out
 }
 
-/// Compute the TextEdit needed to update the tag line, if any change is required.
+/// Compute the TextEdit needed to update `checklist-status` in a TOML metadata
+/// block to `new_status`. Returns None if not found or already correct.
+pub fn compute_toml_status_edit(content: &str, new_status: &str) -> Option<TextEdit> {
+    let block = parser::find_toml_metadata_block(content)?;
+    let lines: Vec<&str> = content.lines().collect();
+
+    for i in block.start_line..=block.end_line {
+        let line = lines.get(i)?;
+        if line.trim_start().starts_with("checklist-status") {
+            let new_line = format!("  checklist-status = \"{new_status}\"");
+            if *line == new_line {
+                return None;
+            }
+            return Some(TextEdit {
+                range: Range {
+                    start: Position {
+                        line: i as u32,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: i as u32,
+                        character: line.len() as u32,
+                    },
+                },
+                new_text: new_line,
+            });
+        }
+    }
+    None
+}
+
+/// Compute the TextEdit needed to update the status, if any change is required.
+/// For TOML-format notes, updates `checklist-status` in the TOML block.
+/// For legacy notes, updates the tag line.
 /// Returns None if no change is needed.
 pub fn compute_tag_edit(content: &str) -> Option<TextEdit> {
     let header = parser::parse_header(content)?;
     let todos = parser::count_todos(content);
     let new_tag = parser::compute_status_tag(&todos, header.archived)?;
 
+    if header.metadata_block.is_some() {
+        let status_str = match new_tag {
+            StatusTag::Done => "done",
+            StatusTag::Wip => "wip",
+            StatusTag::Todo => "todo",
+        };
+        // Only update if the current checklist_status differs
+        let current = header.checklist_status.as_ref();
+        let already_correct = match new_tag {
+            StatusTag::Done => current == Some(&ChecklistStatus::Done),
+            StatusTag::Wip => current == Some(&ChecklistStatus::Wip),
+            StatusTag::Todo => current == Some(&ChecklistStatus::Todo),
+        };
+        if already_correct {
+            return None;
+        }
+        return compute_toml_status_edit(content, status_str);
+    }
+
+    // Legacy path
+    let tag_line_idx = header.tag_line_idx?;
     let new_tag_str = match new_tag {
         StatusTag::Done => "#tag.done",
         StatusTag::Wip => "#tag.wip",
@@ -188,9 +251,8 @@ pub fn compute_tag_edit(content: &str) -> Option<TextEdit> {
     };
 
     let lines: Vec<&str> = content.lines().collect();
-    let tag_line = lines.get(header.tag_line_idx)?;
+    let tag_line = lines.get(tag_line_idx)?;
 
-    // Check if the tag line already has the correct status tag
     let current_tag_str = if tag_line.contains("#tag.done") {
         Some("#tag.done")
     } else if tag_line.contains("#tag.wip") {
@@ -211,7 +273,7 @@ pub fn compute_tag_edit(content: &str) -> Option<TextEdit> {
         format!("{tag_line} {new_tag_str}")
     };
 
-    let line_num = header.tag_line_idx as u32;
+    let line_num = tag_line_idx as u32;
     Some(TextEdit {
         range: Range {
             start: Position {
@@ -389,5 +451,25 @@ mod tests {
         let without_nl = "- [ ] p\n  - [x] c";
         assert!(update_nested_checkboxes(with_nl).ends_with('\n'));
         assert!(!update_nested_checkboxes(without_nl).ends_with('\n'));
+    }
+
+    #[test]
+    fn effective_status_with_no_todos_uses_checklist_status() {
+        // compute_status_tag returns None when there are no todos
+        let empty = parser::TodoStatus {
+            completed: 0,
+            incomplete: 0,
+        };
+        assert_eq!(parser::compute_status_tag(&empty, false), None);
+        // When None, the ref_is_done branch falls through to header.checklist_status
+        // ChecklistStatus::Done → true; ChecklistStatus::None → false
+        assert!(
+            parser::ChecklistStatus::Done == parser::ChecklistStatus::Done,
+            "Done variant equality check"
+        );
+        assert!(
+            parser::ChecklistStatus::None != parser::ChecklistStatus::Done,
+            "None variant inequality check"
+        );
     }
 }

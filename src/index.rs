@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use tokio::fs;
 
 use crate::config::WikiConfig;
-use crate::parser;
+use crate::parser::{self, ChecklistStatus};
 
 #[derive(Debug, Clone)]
 pub struct NoteInfo {
@@ -19,6 +19,8 @@ pub struct NoteInfo {
     pub aliases: Vec<String>,
     pub keywords: Vec<String>,
     pub abstract_text: Option<String>,
+    #[allow(dead_code)]
+    pub checklist_status: Option<ChecklistStatus>,
     pub path: PathBuf,
 }
 
@@ -134,6 +136,7 @@ impl NoteIndex {
                 aliases: header.aliases.clone(),
                 keywords: header.keywords.clone(),
                 abstract_text: header.abstract_text.clone(),
+                checklist_status: header.checklist_status.clone(),
                 path: path.to_path_buf(),
             };
             self.notes.insert(header.id.clone(), info);
