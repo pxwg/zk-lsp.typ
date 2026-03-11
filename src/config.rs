@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct WikiConfig {
-    #[allow(dead_code)]
     pub root: PathBuf,
     pub note_dir: PathBuf,
     pub link_file: PathBuf,
