@@ -272,12 +272,7 @@ impl LanguageServer for ZkLspServer {
                 Err(e) => error!("generate_link_typ: {e}"),
             },
             "zk.newNote" => {
-                let with_meta = params
-                    .arguments
-                    .first()
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                match note_ops::create_note(&self.config, with_meta).await {
+                match note_ops::create_note(&self.config).await {
                     Ok(path) => {
                         info!("created note: {}", path.display());
                         let uri = Url::from_file_path(&path).ok();
