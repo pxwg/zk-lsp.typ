@@ -1,12 +1,10 @@
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 
-use anyhow::Result;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use tower_lsp::lsp_types::*;
 
-use crate::index::NoteIndex;
 use crate::parser::{self, StatusTag, ChecklistStatus};
 
 static RE_TODO_ID: Lazy<Regex> = Lazy::new(|| Regex::new(r"@(\d{10})").unwrap());
@@ -30,38 +28,21 @@ fn apply_tag_edit(content: &str) -> String {
     out
 }
 
-/// Format `content`:
-/// 1. Update `- [ ] @<id>` / `- [x] @<id>` checkboxes by reading referenced
-///    notes from `note_dir` — all IDs on a line must be Done for the box to be
-///    checked, otherwise the box is cleared.
-/// 2. Recompute and apply the note's own status tag based on the updated
-///    checkbox state.
-pub async fn format_content(content: &str, note_dir: &Path) -> String {
-    let after_refs = update_ref_checkboxes(content, note_dir).await;
-    let after_nested = update_nested_checkboxes(&after_refs);
-    apply_tag_edit(&after_nested)
-}
-
-/// Returns true iff the note at `path` has an effective tag of `done`.
+/// Returns true iff `content` has an effective checklist status of Done.
 ///
 /// For TOML-format notes: derive done-ness from todo counts (same logic the
 /// formatter would apply when updating `checklist-status`).
 /// For legacy notes: simulate what `apply_tag_edit` would produce, then check
 /// for `#tag.done`.
-async fn ref_is_done(path: &Path) -> bool {
-    let Ok(content) = tokio::fs::read_to_string(path).await else {
-        return false;
-    };
-    let Some(header) = parser::parse_header(&content) else {
+pub fn is_note_done(content: &str) -> bool {
+    let Some(header) = parser::parse_header(content) else {
         return false;
     };
 
     if header.metadata_block.is_some() {
-        let todos = parser::count_todos(&content);
+        let todos = parser::count_todos(content);
         return match parser::compute_status_tag(&todos, header.archived) {
-            // Note has inline todos → status derived from them (same as compute_tag_edit)
             Some(tag) => tag == StatusTag::Done,
-            // Note has no inline todos → checklist-status is the sole source of truth
             None => header.checklist_status == Some(parser::ChecklistStatus::Done),
         };
     }
@@ -75,17 +56,24 @@ async fn ref_is_done(path: &Path) -> bool {
         .copied()
         .unwrap_or("")
         .to_string();
-    let effective = match compute_tag_edit(&content) {
+    let effective = match compute_tag_edit(content) {
         Some(edit) => edit.new_text,
         None => existing,
     };
     effective.contains("#tag.done")
 }
 
-/// Update `- [ ] @id` / `- [x] @id` checkboxes in `content`.
-/// All `@id` references on a todo line must resolve to Done for the box to be
-/// checked; if any is not Done (or the file cannot be read) the box is cleared.
-async fn update_ref_checkboxes(content: &str, note_dir: &Path) -> String {
+/// Normalize `content` using a pre-built map of dependency states.
+/// Pure (no I/O): looks up each `@ID` in `dep_states` (absent = not done).
+/// Calls `update_ref_checkboxes_sync`, `update_nested_checkboxes`, and `apply_tag_edit`.
+pub fn normalize_note(content: &str, dep_states: &HashMap<String, bool>) -> String {
+    let after_refs = update_ref_checkboxes_sync(content, dep_states);
+    let after_nested = update_nested_checkboxes(&after_refs);
+    apply_tag_edit(&after_nested)
+}
+
+/// Sync version of ref-checkbox update using a pre-built dep_states map.
+fn update_ref_checkboxes_sync(content: &str, dep_states: &HashMap<String, bool>) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let mut result: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
     let mut changed = false;
@@ -101,13 +89,7 @@ async fn update_ref_checkboxes(content: &str, note_dir: &Path) -> String {
         if ids.is_empty() {
             continue;
         }
-        let mut all_done = true;
-        for id in &ids {
-            if !ref_is_done(&note_dir.join(format!("{id}.typ"))).await {
-                all_done = false;
-                break;
-            }
-        }
+        let all_done = ids.iter().all(|id| dep_states.get(*id).copied().unwrap_or(false));
         let new_state = if all_done { 'x' } else { ' ' };
         if get_todo_state(line) != Some(new_state) {
             if let Some(new_line) = replace_todo_state(line, new_state) {
@@ -126,6 +108,42 @@ async fn update_ref_checkboxes(content: &str, note_dir: &Path) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Format `content`:
+/// 1. Update `- [ ] @<id>` / `- [x] @<id>` checkboxes by reading referenced
+///    notes from `note_dir` — all IDs on a line must be Done for the box to be
+///    checked, otherwise the box is cleared.
+/// 2. Recompute and apply the note's own status tag based on the updated
+///    checkbox state.
+pub async fn format_content(content: &str, note_dir: &Path) -> String {
+    // Collect all @IDs referenced on todo lines
+    let mut ids_to_fetch: Vec<String> = Vec::new();
+    for line in content.lines() {
+        if !is_todo_line(line) {
+            continue;
+        }
+        for cap in RE_TODO_ID.captures_iter(line) {
+            if let Some(m) = cap.get(1) {
+                let id = m.as_str().to_string();
+                if !ids_to_fetch.contains(&id) {
+                    ids_to_fetch.push(id);
+                }
+            }
+        }
+    }
+
+    let mut dep_states: HashMap<String, bool> = HashMap::new();
+    for id in ids_to_fetch {
+        let path = note_dir.join(format!("{id}.typ"));
+        let done = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => is_note_done(&c),
+            Err(_) => false,
+        };
+        dep_states.insert(id, done);
+    }
+
+    normalize_note(content, &dep_states)
 }
 
 /// Propagate nested checkbox states bottom-up: if a todo item has children,
@@ -289,76 +307,6 @@ pub fn compute_tag_edit(content: &str) -> Option<TextEdit> {
     })
 }
 
-/// Apply cross-file checkbox propagation: for all notes containing
-/// `- [ ] @<note_id>` or `- [x] @<note_id>`, update the checkbox state.
-pub async fn propagate_tag_change(
-    note_id: &str,
-    new_tag: &StatusTag,
-    index: &Arc<NoteIndex>,
-) -> Result<WorkspaceEdit> {
-    let new_state = if *new_tag == StatusTag::Done {
-        'x'
-    } else {
-        ' '
-    };
-    let pattern = format!("@{note_id}");
-
-    let mut changes: std::collections::HashMap<Url, Vec<TextEdit>> =
-        std::collections::HashMap::new();
-
-    // Use backlinks to find candidate files
-    let backlinks = index.get_backlinks(note_id);
-    let mut seen_files = std::collections::HashSet::new();
-    for loc in &backlinks {
-        seen_files.insert(loc.file.clone());
-    }
-
-    for file_path in &seen_files {
-        let content = match tokio::fs::read_to_string(file_path).await {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let mut edits = Vec::new();
-        for (line_num, line) in content.lines().enumerate() {
-            if !line.contains(&pattern) {
-                continue;
-            }
-            // Only update todo lines
-            if !is_todo_line(line) {
-                continue;
-            }
-            let current_state = get_todo_state(line);
-            if current_state == Some(new_state) {
-                continue;
-            }
-            if let Some(new_line) = replace_todo_state(line, new_state) {
-                edits.push(TextEdit {
-                    range: Range {
-                        start: Position {
-                            line: line_num as u32,
-                            character: 0,
-                        },
-                        end: Position {
-                            line: line_num as u32,
-                            character: line.len() as u32,
-                        },
-                    },
-                    new_text: new_line,
-                });
-            }
-        }
-        if !edits.is_empty() {
-            if let Ok(uri) = Url::from_file_path(file_path) {
-                changes.insert(uri, edits);
-            }
-        }
-    }
-
-    Ok(WorkspaceEdit {
-        changes: Some(changes),
-        ..Default::default()
-    })
-}
 
 fn is_todo_line(line: &str) -> bool {
     let t = line.trim_start();

@@ -7,9 +7,8 @@ use tower_lsp::{Client, LanguageServer};
 use tracing::{error, info};
 
 use crate::config::WikiConfig;
-use crate::handlers::{code_actions, diagnostics, formatting, inlay_hints, references};
+use crate::handlers::{code_actions, diagnostics, inlay_hints, references};
 use crate::index::NoteIndex;
-use crate::parser::StatusTag;
 use crate::{link_gen, note_ops, watcher};
 
 pub struct ZkLspServer {
@@ -133,32 +132,6 @@ impl LanguageServer for ZkLspServer {
 
         // Publish diagnostics for the saved file
         self.publish_diagnostics(uri.clone(), &content).await;
-
-        // Cross-file tag propagation if the note's tag changed to Done/Wip
-        if uri.path().contains("/note/") {
-            if let Some(header) = crate::parser::parse_header(&content) {
-                let todos = crate::parser::count_todos(&content);
-                if let Some(new_tag) = crate::parser::compute_status_tag(&todos, header.archived) {
-                    if new_tag == StatusTag::Done || new_tag == StatusTag::Wip {
-                        match formatting::propagate_tag_change(&header.id, &new_tag, &self.index)
-                            .await
-                        {
-                            Ok(edit) => {
-                                if edit
-                                    .changes
-                                    .as_ref()
-                                    .map(|c| !c.is_empty())
-                                    .unwrap_or(false)
-                                {
-                                    let _ = self.client.apply_edit(edit).await;
-                                }
-                            }
-                            Err(e) => error!("propagate_tag_change: {e}"),
-                        }
-                    }
-                }
-            }
-        }
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {

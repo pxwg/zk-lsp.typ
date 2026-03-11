@@ -30,4 +30,13 @@ pub enum Command {
     Format,
     /// Migrate legacy comment-format notes to TOML schema v1
     Migrate,
+    /// Reconcile cross-file checkbox states across the whole wiki
+    Reconcile {
+        /// Show what would change without writing any files
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Maximum number of convergence rounds
+        #[arg(long, default_value_t = 10)]
+        max_rounds: usize,
+    },
 }

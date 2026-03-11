@@ -6,6 +6,7 @@ mod link_gen;
 mod migrate;
 mod note_ops;
 mod parser;
+mod reconcile;
 mod server;
 mod watcher;
 
@@ -60,6 +61,13 @@ async fn main() -> anyhow::Result<()> {
             eprintln!(
                 "Done: {} migrated, {} already current, {} skipped.",
                 stats.migrated, stats.already_current, stats.skipped
+            );
+        }
+        Command::Reconcile { dry_run, max_rounds } => {
+            let stats = reconcile::run_reconcile(&config, dry_run, max_rounds).await?;
+            eprintln!(
+                "Reconcile: {} round(s), {} file(s) changed, converged: {}",
+                stats.rounds, stats.files_changed, stats.converged
             );
         }
     }
