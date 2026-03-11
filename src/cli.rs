@@ -35,8 +35,5 @@ pub enum Command {
         /// Show what would change without writing any files
         #[arg(long, default_value_t = false)]
         dry_run: bool,
-        /// Maximum number of convergence rounds
-        #[arg(long, default_value_t = 10)]
-        max_rounds: usize,
     },
 }

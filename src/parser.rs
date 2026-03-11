@@ -282,6 +282,121 @@ pub fn parse_header(content: &str) -> Option<NoteHeader> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Checklist item model
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefTarget {
+    pub target_id: String,
+    pub byte_start: u32, // byte offset of '@' within the full line
+    pub byte_end: u32,   // byte offset past the last digit
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChecklistItemKind {
+    Local,
+    Ref { targets: Vec<RefTarget> },
+}
+
+#[derive(Debug, Clone)]
+pub struct ChecklistItem {
+    pub checked: bool,
+    pub kind: ChecklistItemKind,
+    #[allow(dead_code)]
+    pub text: String,
+    pub line_idx: usize,
+    pub indent: usize,
+}
+
+/// Parse all checklist items from `content`, skipping fenced code blocks.
+/// Items with `@(\d{10})` in their text become `Ref` items; all others are `Local`.
+/// `RefTarget.byte_start`/`byte_end` are byte offsets of `@ID` within the full line.
+pub fn parse_checklist_items(content: &str) -> Vec<ChecklistItem> {
+    let mut items = Vec::new();
+    let mut in_fence = false;
+
+    for (line_idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if !(trimmed.starts_with("- [") && trimmed.len() >= 5) {
+            continue;
+        }
+        let marker = trimmed.chars().nth(3).unwrap_or(' ');
+        if marker != 'x' && marker != 'X' && marker != ' ' {
+            continue;
+        }
+        let checked = marker == 'x' || marker == 'X';
+        let indent = line.len() - trimmed.len();
+        // prefix_len: bytes before the checklist body (indent + "- [x] ")
+        let prefix_len = indent + 6;
+        // text after `- [x] ` (or `- [ ] `)
+        let body = trimmed.get(6..).unwrap_or("");
+        let text = body.to_string();
+        let targets: Vec<RefTarget> = RE_ID_REF
+            .captures_iter(body)
+            .map(|c| {
+                let full = c.get(0).unwrap();
+                let id = c.get(1).unwrap().as_str().to_string();
+                RefTarget {
+                    target_id: id,
+                    byte_start: (prefix_len + full.start()) as u32,
+                    byte_end: (prefix_len + full.end()) as u32,
+                }
+            })
+            .collect();
+        let kind = if targets.is_empty() {
+            ChecklistItemKind::Local
+        } else {
+            ChecklistItemKind::Ref { targets }
+        };
+        items.push(ChecklistItem { checked, kind, text, line_idx, indent });
+    }
+    items
+}
+
+/// Evaluate the semantic truth of a single checklist item.
+/// `Local` items: truth = checkbox state.
+/// `Ref` items: truth = `∀ t ∈ targets: done_lookup(t.target_id)` — never the rendered checkbox.
+pub fn eval_item_truth(item: &ChecklistItem, done_lookup: &impl Fn(&str) -> bool) -> bool {
+    match &item.kind {
+        ChecklistItemKind::Local => item.checked,
+        ChecklistItemKind::Ref { targets } => targets.iter().all(|t| done_lookup(&t.target_id)),
+    }
+}
+
+fn is_leaf(items: &[ChecklistItem], idx: usize) -> bool {
+    idx + 1 >= items.len() || items[idx + 1].indent <= items[idx].indent
+}
+
+/// Compute whether a note is done based on its checklist items and a dependency lookup.
+///
+/// Only **leaf items** participate: a leaf is an item with no subsequent item
+/// with strictly greater indent before the next same-or-lesser-indent item.
+/// Non-leaf LocalItems are derived display views and must not be counted as source facts.
+/// If there are no items, returns `false` (caller should check metadata separately).
+pub fn compute_note_done_from_items(
+    items: &[ChecklistItem],
+    done_lookup: &impl Fn(&str) -> bool,
+) -> bool {
+    let leaves: Vec<&ChecklistItem> = items
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| is_leaf(items, *i))
+        .map(|(_, item)| item)
+        .collect();
+    if leaves.is_empty() {
+        return false;
+    }
+    leaves.iter().all(|item| eval_item_truth(item, done_lookup))
+}
+
 /// Count todo items, skipping code blocks (``` fence heuristic).
 pub fn count_todos(content: &str) -> TodoStatus {
     let mut status = TodoStatus::default();
@@ -484,6 +599,31 @@ pub(crate) mod tests {
         assert_eq!(byte_to_utf16(line, refs[0].start_char as usize), 16);
         // end byte offset = 20 + 11 = 31, UTF-16 = 16 + 11 = 27
         assert_eq!(byte_to_utf16(line, refs[0].end_char as usize), 27);
+    }
+
+    #[test]
+    fn test_ref_target_spans() {
+        // Line: "  - [ ] @1111111111 and @2222222222"
+        // indent=2, prefix_len=8
+        // "@1111111111" starts at byte 8, ends at 19
+        // "@2222222222" starts at byte 24, ends at 35
+        let line = "  - [ ] @1111111111 and @2222222222";
+        let content = format!("{line}\n");
+        let items = parse_checklist_items(&content);
+        assert_eq!(items.len(), 1);
+        if let ChecklistItemKind::Ref { targets } = &items[0].kind {
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[0].target_id, "1111111111");
+            assert_eq!(targets[0].byte_start, 8);
+            assert_eq!(targets[0].byte_end, 19);
+            assert_eq!(&line[8..19], "@1111111111");
+            assert_eq!(targets[1].target_id, "2222222222");
+            assert_eq!(targets[1].byte_start, 24);
+            assert_eq!(targets[1].byte_end, 35);
+            assert_eq!(&line[24..35], "@2222222222");
+        } else {
+            panic!("expected Ref kind");
+        }
     }
 
     #[test]

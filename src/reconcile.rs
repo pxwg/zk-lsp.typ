@@ -1,15 +1,16 @@
 /// Workspace-wide reconciliation of cross-file checkbox states.
 ///
-/// Walks all notes, builds a dependency graph (A depends on B if A has
-/// `- [ ] @B` on a todo line), computes SCCs via Tarjan's algorithm, resolves
-/// a fixed-point in topological order, then rewrites changed files.
-use std::collections::HashMap;
+/// Builds a dependency graph from `RefItem` checklist entries, fails fast on cycles,
+/// then evaluates note done-states in a single topological pass and rewrites changed files.
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 use anyhow::Result;
 
 use crate::config::WikiConfig;
-use crate::handlers::formatting::{is_note_done, normalize_note};
+use crate::cycle;
+use crate::dependency_graph;
+use crate::handlers::formatting::{is_note_done_with_deps, normalize_note};
 use crate::parser;
 
 struct NoteRec {
@@ -18,9 +19,7 @@ struct NoteRec {
 }
 
 pub struct ReconcileStats {
-    pub rounds: usize,
     pub files_changed: usize,
-    pub converged: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -54,298 +53,144 @@ async fn scan_notes(note_dir: &std::path::Path) -> Result<HashMap<String, NoteRe
 }
 
 // ---------------------------------------------------------------------------
-// Dependency extraction
+// Dependency extraction helper (for normalizing individual notes)
 // ---------------------------------------------------------------------------
 
 fn extract_todo_deps(content: &str) -> Vec<String> {
-    let mut deps = Vec::new();
-    for line in content.lines() {
-        let t = line.trim_start();
-        if !(t.starts_with("- [") && t.len() >= 5) {
-            continue;
-        }
-        for cap in parser::RE_ID_REF.captures_iter(line) {
-            if let Some(m) = cap.get(1) {
-                let id = m.as_str().to_string();
-                if !deps.contains(&id) {
-                    deps.push(id);
-                }
+    let mut seen = std::collections::HashSet::new();
+    parser::parse_checklist_items(content)
+        .into_iter()
+        .flat_map(|item| match item.kind {
+            parser::ChecklistItemKind::Ref { targets } => {
+                targets.into_iter().map(|t| t.target_id).collect::<Vec<_>>()
             }
-        }
-    }
-    deps
-}
-
-fn build_dep_graph(notes: &HashMap<String, NoteRec>) -> HashMap<String, Vec<String>> {
-    notes
-        .iter()
-        .map(|(id, rec)| (id.clone(), extract_todo_deps(&rec.content)))
+            parser::ChecklistItemKind::Local => vec![],
+        })
+        .filter(|id| seen.insert(id.clone()))
         .collect()
 }
 
 // ---------------------------------------------------------------------------
-// Tarjan SCC
+// Topological sort (Kahn's algorithm on adj where A→B means A depends on B)
 // ---------------------------------------------------------------------------
 
-struct TarjanState<'a> {
-    graph: &'a HashMap<String, Vec<String>>,
-    index_counter: usize,
-    stack: Vec<String>,
-    on_stack: HashMap<String, bool>,
-    index: HashMap<String, usize>,
-    lowlink: HashMap<String, usize>,
-    sccs: Vec<Vec<String>>,
-}
-
-impl<'a> TarjanState<'a> {
-    fn strongconnect(&mut self, v: &str) {
-        self.index.insert(v.to_string(), self.index_counter);
-        self.lowlink.insert(v.to_string(), self.index_counter);
-        self.index_counter += 1;
-        self.stack.push(v.to_string());
-        self.on_stack.insert(v.to_string(), true);
-
-        if let Some(neighbors) = self.graph.get(v) {
-            let neighbors: Vec<String> = neighbors.clone();
-            for w in neighbors {
-                if !self.index.contains_key(&w) {
-                    self.strongconnect(&w);
-                    let lv = *self.lowlink.get(v).unwrap();
-                    let lw = *self.lowlink.get(&w).unwrap_or(&usize::MAX);
-                    self.lowlink.insert(v.to_string(), lv.min(lw));
-                } else if *self.on_stack.get(&w).unwrap_or(&false) {
-                    let lv = *self.lowlink.get(v).unwrap();
-                    let iw = *self.index.get(&w).unwrap();
-                    self.lowlink.insert(v.to_string(), lv.min(iw));
-                }
+fn topo_sort_dag(adj: &HashMap<String, Vec<String>>, all_nodes: &[String]) -> Vec<String> {
+    let mut in_degree: HashMap<&str, usize> =
+        all_nodes.iter().map(|n| (n.as_str(), 0)).collect();
+    for targets in adj.values() {
+        for t in targets {
+            if let Some(d) = in_degree.get_mut(t.as_str()) {
+                *d += 1;
             }
         }
-
-        if self.lowlink.get(v) == self.index.get(v) {
-            let mut scc = Vec::new();
-            loop {
-                let w = self.stack.pop().unwrap();
-                self.on_stack.insert(w.clone(), false);
-                scc.push(w.clone());
-                if w == v {
-                    break;
-                }
-            }
-            self.sccs.push(scc);
-        }
     }
-}
-
-fn tarjan_sccs(
-    graph: &HashMap<String, Vec<String>>,
-    all_nodes: &[String],
-) -> Vec<Vec<String>> {
-    let mut state = TarjanState {
-        graph,
-        index_counter: 0,
-        stack: Vec::new(),
-        on_stack: HashMap::new(),
-        index: HashMap::new(),
-        lowlink: HashMap::new(),
-        sccs: Vec::new(),
-    };
-    for v in all_nodes {
-        if !state.index.contains_key(v.as_str()) {
-            state.strongconnect(v);
-        }
-    }
-    state.sccs
-}
-
-// ---------------------------------------------------------------------------
-// SCC DAG + topological order
-// ---------------------------------------------------------------------------
-
-fn scc_dag(
-    sccs: &[Vec<String>],
-    graph: &HashMap<String, Vec<String>>,
-) -> HashMap<usize, Vec<usize>> {
-    // Map each node to its SCC index
-    let mut node_to_scc: HashMap<&str, usize> = HashMap::new();
-    for (i, scc) in sccs.iter().enumerate() {
-        for node in scc {
-            node_to_scc.insert(node.as_str(), i);
-        }
-    }
-
-    let mut dag: HashMap<usize, Vec<usize>> = HashMap::new();
-    for i in 0..sccs.len() {
-        dag.entry(i).or_default();
-    }
-
-    for (i, scc) in sccs.iter().enumerate() {
-        for node in scc {
-            if let Some(neighbors) = graph.get(node) {
-                for nb in neighbors {
-                    if let Some(&j) = node_to_scc.get(nb.as_str()) {
-                        if j != i {
-                            let edges = dag.entry(i).or_default();
-                            if !edges.contains(&j) {
-                                edges.push(j);
-                            }
-                        }
+    let mut queue: VecDeque<&str> = in_degree
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(n, _)| *n)
+        .collect();
+    let mut order: Vec<String> = Vec::new();
+    while let Some(n) = queue.pop_front() {
+        order.push(n.to_string());
+        if let Some(targets) = adj.get(n) {
+            for t in targets {
+                if let Some(d) = in_degree.get_mut(t.as_str()) {
+                    *d -= 1;
+                    if *d == 0 {
+                        queue.push_back(t.as_str());
                     }
                 }
             }
         }
     }
-    dag
-}
-
-fn topo_order(dag: &HashMap<usize, Vec<usize>>, n: usize) -> Vec<usize> {
-    let mut in_degree = vec![0usize; n];
-    for neighbors in dag.values() {
-        for &j in neighbors {
-            in_degree[j] += 1;
-        }
-    }
-    let mut queue: std::collections::VecDeque<usize> = (0..n)
-        .filter(|&i| in_degree[i] == 0)
-        .collect();
-    let mut order = Vec::new();
-    while let Some(i) = queue.pop_front() {
-        order.push(i);
-        if let Some(neighbors) = dag.get(&i) {
-            for &j in neighbors {
-                in_degree[j] -= 1;
-                if in_degree[j] == 0 {
-                    queue.push_back(j);
-                }
-            }
-        }
-    }
-    // If there are cycles in the DAG (shouldn't happen after SCC), append remaining
-    for i in 0..n {
-        if !order.contains(&i) {
-            order.push(i);
+    // Append any isolated nodes not reached by Kahn's traversal
+    for n in all_nodes {
+        if !order.contains(n) {
+            order.push(n.clone());
         }
     }
     order
 }
 
 // ---------------------------------------------------------------------------
-// Fixed-point solver
+// Single-pass DAG evaluation
 // ---------------------------------------------------------------------------
 
-fn compute_node_done(content: &str, dep_states: &HashMap<String, bool>) -> bool {
-    let updated = normalize_note(content, dep_states);
-    is_note_done(&updated)
-}
-
-fn solve_scc(
-    scc: &[String],
-    external: &HashMap<String, bool>,
+fn evaluate_dag(
     notes: &HashMap<String, NoteRec>,
+    adj: &HashMap<String, Vec<String>>,
 ) -> HashMap<String, bool> {
-    let mut internal: HashMap<String, bool> = scc
-        .iter()
-        .map(|id| (id.clone(), false))
-        .collect();
-
-    // Fixed-point iteration (max 100 rounds to guard against bugs)
-    for _ in 0..100 {
-        let mut new_states: HashMap<String, bool> = HashMap::new();
-        for id in scc {
-            let content = match notes.get(id) {
-                Some(r) => r.content.as_str(),
-                None => {
-                    new_states.insert(id.clone(), false);
-                    continue;
-                }
-            };
-            let mut combined = external.clone();
-            combined.extend(internal.iter().map(|(k, v)| (k.clone(), *v)));
-            new_states.insert(id.clone(), compute_node_done(content, &combined));
-        }
-        if new_states == internal {
-            break;
-        }
-        internal = new_states;
-    }
-    internal
-}
-
-fn solve_global(notes: &HashMap<String, NoteRec>) -> HashMap<String, bool> {
-    let graph = build_dep_graph(notes);
-    let all_nodes: Vec<String> = notes.keys().cloned().collect();
-    let sccs = tarjan_sccs(&graph, &all_nodes);
-
-    // Build DAG and process in reverse topological order (dependencies first)
-    let dag = scc_dag(&sccs, &graph);
-    let order = topo_order(&dag, sccs.len());
+    let all_nodes: Vec<String> = adj.keys().cloned().collect();
+    let order = topo_sort_dag(adj, &all_nodes);
 
     let mut global: HashMap<String, bool> = HashMap::new();
-    // Process in reverse order so that dependencies come first
-    for &scc_idx in order.iter().rev() {
-        let scc = &sccs[scc_idx];
-        let external: HashMap<String, bool> = global
-            .iter()
-            .filter(|(id, _)| !scc.contains(id))
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
-        let result = solve_scc(scc, &external, notes);
-        global.extend(result);
+    // Iterate in reverse so that dependencies (pointed-to nodes) are evaluated first.
+    // adj[A] = [B] means A depends on B; Kahn gives [A, B]; rev gives [B, A] → B evaluated first.
+    for id in order.iter().rev() {
+        let content = match notes.get(id) {
+            Some(r) => r.content.as_str(),
+            None => {
+                global.insert(id.clone(), false);
+                continue;
+            }
+        };
+        let done = is_note_done_with_deps(content, &global);
+        global.insert(id.clone(), done);
     }
     global
 }
 
 // ---------------------------------------------------------------------------
-// Rewrite + convergence loop
+// Public entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run_reconcile(
-    config: &WikiConfig,
-    dry_run: bool,
-    max_rounds: usize,
-) -> Result<ReconcileStats> {
-    let mut total_changed = 0usize;
+pub async fn run_reconcile(config: &WikiConfig, dry_run: bool) -> Result<ReconcileStats> {
+    let notes = scan_notes(&config.note_dir).await?;
 
-    for round in 0..max_rounds {
-        let notes = scan_notes(&config.note_dir).await?;
-        let global = solve_global(&notes);
+    // Build positioned dependency graph
+    let note_map: HashMap<String, (PathBuf, String)> = notes
+        .iter()
+        .map(|(id, rec)| (id.clone(), (rec.path.clone(), rec.content.clone())))
+        .collect();
+    let graph = dependency_graph::build_dependency_graph(&note_map);
 
-        let mut round_changed = 0usize;
-        for (_id, rec) in &notes {
-            let dep_states: HashMap<String, bool> = extract_todo_deps(&rec.content)
-                .into_iter()
-                .map(|dep_id| {
-                    let done = global.get(&dep_id).copied().unwrap_or(false);
-                    (dep_id, done)
-                })
-                .collect();
+    // Fail fast on cycles
+    let cycles = cycle::detect_cycles(&graph);
+    if !cycles.is_empty() {
+        let msg = cycle::render_cycle_errors(&cycles);
+        eprintln!("{msg}");
+        return Err(anyhow::anyhow!(
+            "{} cyclic task dependency(ies) detected; aborting reconcile",
+            cycles.len()
+        ));
+    }
 
-            let new_content = normalize_note(&rec.content, &dep_states);
-            if new_content != rec.content {
-                round_changed += 1;
-                if !dry_run {
-                    tokio::fs::write(&rec.path, new_content.as_bytes()).await?;
-                } else {
-                    eprintln!("  would update: {}", rec.path.display());
-                }
+    // Single-pass DAG evaluation
+    let global = evaluate_dag(&notes, &graph.adj);
+
+    // Write back changed files
+    let mut files_changed = 0usize;
+    for (_id, rec) in &notes {
+        let dep_states: HashMap<String, bool> = extract_todo_deps(&rec.content)
+            .into_iter()
+            .map(|dep_id| {
+                let done = global.get(&dep_id).copied().unwrap_or(false);
+                (dep_id, done)
+            })
+            .collect();
+
+        let new_content = normalize_note(&rec.content, &dep_states);
+        if new_content != rec.content {
+            files_changed += 1;
+            if !dry_run {
+                tokio::fs::write(&rec.path, new_content.as_bytes()).await?;
+            } else {
+                eprintln!("  would update: {}", rec.path.display());
             }
-        }
-
-        total_changed += round_changed;
-
-        if round_changed == 0 {
-            return Ok(ReconcileStats {
-                rounds: round + 1,
-                files_changed: total_changed,
-                converged: true,
-            });
         }
     }
 
-    Ok(ReconcileStats {
-        rounds: max_rounds,
-        files_changed: total_changed,
-        converged: false,
-    })
+    Ok(ReconcileStats { files_changed })
 }
 
 // ---------------------------------------------------------------------------
@@ -355,7 +200,9 @@ pub async fn run_reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handlers::formatting::normalize_note;
+    use crate::cycle;
+    use crate::dependency_graph;
+    use crate::handlers::formatting::{is_note_done, is_note_done_with_deps, normalize_note};
 
     fn make_toml_note(title: &str, id: &str, status: &str, body: &str) -> String {
         format!(
@@ -377,6 +224,43 @@ mod tests {
     }
 
     #[test]
+    fn refitem_rendered_checked_not_source_truth() {
+        let content = "- [x] @2222222222\n";
+        let deps = HashMap::from([("2222222222".to_string(), false)]);
+        assert!(
+            !is_note_done_with_deps(content, &deps),
+            "rendered [x] on RefItem must not override semantic truth from dep_states"
+        );
+    }
+
+    #[test]
+    fn refitem_drives_note_status() {
+        let content_a = make_toml_note("A", "1111111111", "none",
+            "- [x] local task\n- [ ] @2222222222\n");
+
+        let deps_b_not_done = HashMap::from([("2222222222".to_string(), false)]);
+        assert!(
+            !is_note_done_with_deps(&content_a, &deps_b_not_done),
+            "A not done when B is not done, despite local task done"
+        );
+
+        let deps_b_done = HashMap::from([("2222222222".to_string(), true)]);
+        assert!(
+            is_note_done_with_deps(&content_a, &deps_b_done),
+            "A done when all leaf items (local + ref) are satisfied"
+        );
+    }
+
+    #[test]
+    fn normalize_note_is_local_only() {
+        let content = make_toml_note("A", "1111111111", "none", "- [ ] @2222222222\n");
+        let deps = HashMap::from([("2222222222".to_string(), true)]);
+        let result = normalize_note(&content, &deps);
+        assert!(result.contains("- [x]"), "ref checkbox updated");
+        assert!(result.contains("<1111111111>"), "still note A's content");
+    }
+
+    #[test]
     fn normalize_note_is_pure() {
         let content = "- [ ] @1234567890 do thing\n";
         let mut dep_states = HashMap::new();
@@ -386,22 +270,20 @@ mod tests {
     }
 
     #[test]
-    fn scc_cycle_no_spurious_done() {
-        // A depends on B, B depends on A; neither has local tasks done
-        let content_a = "- [ ] @2222222222\n";
-        let content_b = "- [ ] @1111111111\n";
-        let mut notes = HashMap::new();
-        notes.insert(
+    fn cycle_reconcile_fails() {
+        // A depends on B, B depends on A → detect_cycles must return non-empty
+        let mut note_map: HashMap<String, (PathBuf, String)> = HashMap::new();
+        note_map.insert(
             "1111111111".to_string(),
-            NoteRec { path: PathBuf::from("1111111111.typ"), content: content_a.to_string() },
+            (PathBuf::from("1111111111.typ"), "- [ ] @2222222222\n".to_string()),
         );
-        notes.insert(
+        note_map.insert(
             "2222222222".to_string(),
-            NoteRec { path: PathBuf::from("2222222222.typ"), content: content_b.to_string() },
+            (PathBuf::from("2222222222.typ"), "- [ ] @1111111111\n".to_string()),
         );
-        let global = solve_global(&notes);
-        assert!(!global.get("1111111111").copied().unwrap_or(true));
-        assert!(!global.get("2222222222").copied().unwrap_or(true));
+        let graph = dependency_graph::build_dependency_graph(&note_map);
+        let cycles = cycle::detect_cycles(&graph);
+        assert!(!cycles.is_empty(), "cyclic notes must be detected as a cycle");
     }
 
     #[test]
@@ -435,8 +317,74 @@ mod tests {
     }
 
     #[test]
+    fn multi_ref_item_requires_all_done() {
+        let content = make_toml_note("X", "3333333333", "none",
+            "- [ ] @1111111111 @2222222222\n");
+
+        let deps_both = HashMap::from([
+            ("1111111111".to_string(), true),
+            ("2222222222".to_string(), true),
+        ]);
+        assert!(is_note_done_with_deps(&content, &deps_both),
+            "done when all refs done");
+
+        let deps_one = HashMap::from([
+            ("1111111111".to_string(), true),
+            ("2222222222".to_string(), false),
+        ]);
+        assert!(!is_note_done_with_deps(&content, &deps_one),
+            "not done when one ref is not done");
+    }
+
+    #[test]
+    fn no_checklist_note_uses_metadata_status() {
+        let content_done = make_toml_note("D", "4444444444", "done", "");
+        let content_none = make_toml_note("N", "5555555555", "none", "");
+        assert!(is_note_done_with_deps(&content_done, &HashMap::new()));
+        assert!(!is_note_done_with_deps(&content_none, &HashMap::new()));
+        let irrelevant_deps = HashMap::from([("9999999999".to_string(), true)]);
+        assert!(is_note_done_with_deps(&content_done, &irrelevant_deps));
+        assert!(!is_note_done_with_deps(&content_none, &irrelevant_deps));
+    }
+
+    #[test]
+    fn test_dag_reconcile_still_works() {
+        // A: done via metadata; B depends on A; C depends on B
+        // Single-pass DAG evaluation should propagate correctly.
+        let content_a = make_toml_note("A", "1010101010", "done", "");
+        let content_b = make_toml_note("B", "2020202020", "none", "- [ ] @1010101010\n");
+        let content_c = make_toml_note("C", "3030303030", "none", "- [ ] @2020202020\n");
+
+        let mut notes = HashMap::new();
+        notes.insert(
+            "1010101010".to_string(),
+            NoteRec { path: PathBuf::from("1010101010.typ"), content: content_a.clone() },
+        );
+        notes.insert(
+            "2020202020".to_string(),
+            NoteRec { path: PathBuf::from("2020202020.typ"), content: content_b.clone() },
+        );
+        notes.insert(
+            "3030303030".to_string(),
+            NoteRec { path: PathBuf::from("3030303030.typ"), content: content_c.clone() },
+        );
+
+        let note_map: HashMap<String, (PathBuf, String)> = notes
+            .iter()
+            .map(|(id, rec)| (id.clone(), (rec.path.clone(), rec.content.clone())))
+            .collect();
+        let graph = dependency_graph::build_dependency_graph(&note_map);
+        let cycles = cycle::detect_cycles(&graph);
+        assert!(cycles.is_empty(), "A→B→C DAG must have no cycles");
+
+        let global = evaluate_dag(&notes, &graph.adj);
+        assert!(global.get("1010101010").copied().unwrap_or(false), "A should be done");
+        assert!(global.get("2020202020").copied().unwrap_or(false), "B should be done (A done)");
+        assert!(global.get("3030303030").copied().unwrap_or(false), "C should be done (B done)");
+    }
+
+    #[test]
     fn reconcile_idempotent_in_memory() {
-        // Simulate two rounds of solve_global: second should yield no changes
         let content_a = make_toml_note("A", "4040404040", "done", "");
         let content_b = make_toml_note("B", "5050505050", "none", "- [ ] @4040404040\n");
 
@@ -450,7 +398,12 @@ mod tests {
             NoteRec { path: PathBuf::from("5050505050.typ"), content: content_b.clone() },
         );
 
-        let global = solve_global(&notes);
+        let note_map: HashMap<String, (PathBuf, String)> = notes
+            .iter()
+            .map(|(id, rec)| (id.clone(), (rec.path.clone(), rec.content.clone())))
+            .collect();
+        let graph = dependency_graph::build_dependency_graph(&note_map);
+        let global = evaluate_dag(&notes, &graph.adj);
 
         // Apply first round of rewrites in memory
         let mut updated: HashMap<String, String> = HashMap::new();
@@ -467,14 +420,17 @@ mod tests {
         for (id, content) in &updated {
             notes2.insert(
                 id.clone(),
-                NoteRec {
-                    path: notes[id].path.clone(),
-                    content: content.clone(),
-                },
+                NoteRec { path: notes[id].path.clone(), content: content.clone() },
             );
         }
 
-        let global2 = solve_global(&notes2);
+        let note_map2: HashMap<String, (PathBuf, String)> = notes2
+            .iter()
+            .map(|(id, rec)| (id.clone(), (rec.path.clone(), rec.content.clone())))
+            .collect();
+        let graph2 = dependency_graph::build_dependency_graph(&note_map2);
+        let global2 = evaluate_dag(&notes2, &graph2.adj);
+
         let mut changed = 0usize;
         for (id, rec) in &notes2 {
             let deps: HashMap<String, bool> = extract_todo_deps(&rec.content)

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tower_lsp::lsp_types::*;
 
+use crate::cycle::DependencyCycle;
 use crate::index::NoteIndex;
 use crate::parser;
 
@@ -104,4 +105,95 @@ pub fn get_diagnostics(content: &str, index: &Arc<NoteIndex>, uri_path: &str) ->
     }
 
     diagnostics
+}
+
+/// Generate LSP diagnostics for `@ID` occurrences that participate in cycles.
+///
+/// Filters `cycles` to only occurrences whose `file_path` matches `file_path`.
+/// Uses `byte_to_utf16` for correct LSP `character` positions (not raw byte offsets).
+pub fn get_cycle_diagnostics(
+    content: &str,
+    file_path: &std::path::Path,
+    cycles: &[DependencyCycle],
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for cycle in cycles {
+        for occ in &cycle.edges {
+            if occ.file_path != file_path {
+                continue;
+            }
+            let line_text = content.lines().nth(occ.line).unwrap_or("");
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position {
+                        line: occ.line as u32,
+                        character: parser::byte_to_utf16(line_text, occ.byte_start as usize),
+                    },
+                    end: Position {
+                        line: occ.line as u32,
+                        character: parser::byte_to_utf16(line_text, occ.byte_end as usize),
+                    },
+                },
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some("zk-lsp".into()),
+                message: format!(
+                    "Cyclic task dependency: {} → … → {}",
+                    occ.from_note_id, occ.from_note_id
+                ),
+                ..Default::default()
+            });
+        }
+    }
+    diagnostics
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cycle::DependencyCycle;
+    use crate::dependency_graph::CycleEdgeOccurrence;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_cycle_diagnostic_range() {
+        // Line with CJK to verify byte_to_utf16 is used, not raw bytes
+        // "- [ ] 你好 @1111111111"
+        // indent=0, prefix_len=6
+        // "你好 " = 3+3+1 = 7 bytes, but 3 UTF-16 units
+        // "@1111111111" starts at byte 6+7=13, ends at 6+7+11=24
+        // UTF-16 start = 6 + 2 (你=1, 好=1) + 1 (space) = 9... let me compute:
+        // "- [ ] " = 6 bytes/chars (all ASCII)
+        // "你" = 3 bytes, 1 UTF-16 unit
+        // "好" = 3 bytes, 1 UTF-16 unit
+        // " " = 1 byte, 1 UTF-16 unit
+        // "@1111111111" starts at byte 13, UTF-16 char 9
+        let line_text = "- [ ] 你好 @1111111111";
+        let content = format!("{line_text}\n");
+        // byte offsets: '@' at byte 13, end at byte 24
+        let byte_start = line_text.find('@').unwrap() as u32;
+        let byte_end = byte_start + 11;
+
+        let occ = CycleEdgeOccurrence {
+            from_note_id: "1111111111".to_string(),
+            to_note_id: "2222222222".to_string(),
+            file_path: PathBuf::from("/wiki/note/1111111111.typ"),
+            line: 0,
+            byte_start,
+            byte_end,
+            line_text: line_text.to_string(),
+        };
+        let cycle = DependencyCycle { nodes: vec!["1111111111".into()], edges: vec![occ] };
+
+        let diags = get_cycle_diagnostics(
+            &content,
+            std::path::Path::new("/wiki/note/1111111111.typ"),
+            &[cycle],
+        );
+        assert_eq!(diags.len(), 1);
+        let range = diags[0].range;
+        // UTF-16 start: "- [ ] " (6) + "你好 " (3 units) = 9
+        assert_eq!(range.start.character, 9, "start must be UTF-16 offset, not byte offset");
+        // UTF-16 end: 9 + 11 = 20
+        assert_eq!(range.end.character, 20);
+    }
 }

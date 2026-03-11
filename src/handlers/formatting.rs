@@ -28,39 +28,55 @@ fn apply_tag_edit(content: &str) -> String {
     out
 }
 
-/// Returns true iff `content` has an effective checklist status of Done.
+/// Canonical semantic evaluator: is `content` done given `deps` (id → done)?
 ///
-/// For TOML-format notes: derive done-ness from todo counts (same logic the
-/// formatter would apply when updating `checklist-status`).
-/// For legacy notes: simulate what `apply_tag_edit` would produce, then check
-/// for `#tag.done`.
+/// - Archived notes are always done.
+/// - If the note has checklist items: evaluates **leaf items only** using
+///   `deps` for RefItems and checkbox state for LocalItems.
+/// - If the note has no checklist items: falls back to `checklist-status`
+///   metadata (written by `reconcile`).
+/// - Returns `false` if the note has no parseable header.
+///
+/// This function does NOT call `normalize_note` or `count_todos`; it works
+/// directly on raw content.
+pub fn is_note_done_with_deps(content: &str, deps: &HashMap<String, bool>) -> bool {
+    let Some(header) = parser::parse_header(content) else {
+        return false;
+    };
+    if header.archived {
+        return true;
+    }
+    let items = parser::parse_checklist_items(content);
+    if items.is_empty() {
+        return header.checklist_status == Some(ChecklistStatus::Done);
+    }
+    parser::compute_note_done_from_items(&items, &|id| deps.get(id).copied().unwrap_or(false))
+}
+
+/// Best-effort done check for reading dependency notes (formatter path).
+///
+/// Trusts explicit `checklist-status` metadata written by `reconcile` first.
+/// Falls back to leaf-item semantics with an empty dep context (RefItems
+/// default to not-done when no global state is available).
+///
+/// NOTE: May underestimate done-ness for notes with RefItems that haven't been
+/// reconciled. For authoritative global evaluation, use `reconcile` +
+/// `is_note_done_with_deps`.
 pub fn is_note_done(content: &str) -> bool {
     let Some(header) = parser::parse_header(content) else {
         return false;
     };
-
-    if header.metadata_block.is_some() {
-        let todos = parser::count_todos(content);
-        return match parser::compute_status_tag(&todos, header.archived) {
-            Some(tag) => tag == StatusTag::Done,
-            None => header.checklist_status == Some(parser::ChecklistStatus::Done),
-        };
+    if header.archived {
+        return true;
     }
-
-    let Some(tag_line_idx) = header.tag_line_idx else {
-        return false;
-    };
-    let lines: Vec<&str> = content.lines().collect();
-    let existing = lines
-        .get(tag_line_idx)
-        .copied()
-        .unwrap_or("")
-        .to_string();
-    let effective = match compute_tag_edit(content) {
-        Some(edit) => edit.new_text,
-        None => existing,
-    };
-    effective.contains("#tag.done")
+    // Trust explicit status written by reconcile first
+    match &header.checklist_status {
+        Some(ChecklistStatus::Done) => return true,
+        Some(ChecklistStatus::Todo) | Some(ChecklistStatus::Wip) => return false,
+        _ => {}
+    }
+    // Fallback: evaluate leaf items with empty dep context
+    is_note_done_with_deps(content, &HashMap::new())
 }
 
 /// Normalize `content` using a pre-built map of dependency states.
@@ -77,8 +93,16 @@ fn update_ref_checkboxes_sync(content: &str, dep_states: &HashMap<String, bool>)
     let lines: Vec<&str> = content.lines().collect();
     let mut result: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
     let mut changed = false;
+    let mut in_fence = false;
 
     for (i, line) in lines.iter().enumerate() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
         if !is_todo_line(line) {
             continue;
         }
@@ -110,16 +134,28 @@ fn update_ref_checkboxes_sync(content: &str, dep_states: &HashMap<String, bool>)
     out
 }
 
-/// Format `content`:
-/// 1. Update `- [ ] @<id>` / `- [x] @<id>` checkboxes by reading referenced
-///    notes from `note_dir` — all IDs on a line must be Done for the box to be
-///    checked, otherwise the box is cleared.
-/// 2. Recompute and apply the note's own status tag based on the updated
-///    checkbox state.
+/// Format `content` against the on-disk note directory.
+///
+/// 1. Reads referenced notes to build a `dep_states` snapshot (via `is_note_done`).
+/// 2. Updates `- [ ] @<id>` / `- [x] @<id>` checkboxes and propagates nested states.
+/// 3. Recomputes and applies the note's own `checklist-status` tag.
+///
+/// Boundary: reads (never writes) referenced notes. `is_note_done` on dependency
+/// content is a best-effort read of their current reconciled state (trusts metadata
+/// written by `reconcile`). This function does NOT perform global graph solving
+/// (SCC/DAG/fixed-point); that responsibility belongs exclusively to `reconcile`.
 pub async fn format_content(content: &str, note_dir: &Path) -> String {
-    // Collect all @IDs referenced on todo lines
+    // Collect all @IDs referenced on todo lines (skip fenced blocks)
     let mut ids_to_fetch: Vec<String> = Vec::new();
+    let mut in_fence = false;
     for line in content.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
         if !is_todo_line(line) {
             continue;
         }
@@ -152,18 +188,22 @@ pub async fn format_content(content: &str, note_dir: &Path) -> String {
 fn update_nested_checkboxes(content: &str) -> String {
     let mut owned_lines: Vec<String> = content.lines().map(str::to_string).collect();
 
-    let todo_items: Vec<(usize, usize)> = owned_lines
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, line)| {
-            if is_todo_line(line) {
-                let indent = line.len() - line.trim_start().len();
-                Some((idx, indent))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let mut todo_items: Vec<(usize, usize)> = Vec::new();
+    let mut in_fence = false;
+    for (idx, line) in owned_lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if is_todo_line(line) {
+            let indent = line.len() - trimmed.len();
+            todo_items.push((idx, indent));
+        }
+    }
 
     for i in (0..todo_items.len()).rev() {
         let (line_idx, indent) = todo_items[i];
@@ -185,7 +225,11 @@ fn update_nested_checkboxes(content: &str) -> String {
             .iter()
             .all(|&child_idx| get_todo_state(&owned_lines[child_idx]) == Some('x'));
 
-        let new_state = if all_done { 'x' } else { ' ' };
+        // If the parent has @ID refs, its checkbox was already set by update_ref_checkboxes_sync.
+        // Respect that: only promote to [x] if the ref is also satisfied.
+        let has_ref = RE_TODO_ID.is_match(&owned_lines[line_idx]);
+        let ref_satisfied = !has_ref || get_todo_state(&owned_lines[line_idx]) == Some('x');
+        let new_state = if all_done && ref_satisfied { 'x' } else { ' ' };
         if get_todo_state(&owned_lines[line_idx]) != Some(new_state) {
             if let Some(new_line) = replace_todo_state(&owned_lines[line_idx], new_state) {
                 owned_lines[line_idx] = new_line;
@@ -399,6 +443,44 @@ mod tests {
         let without_nl = "- [ ] p\n  - [x] c";
         assert!(update_nested_checkboxes(with_nl).ends_with('\n'));
         assert!(!update_nested_checkboxes(without_nl).ends_with('\n'));
+    }
+
+    #[test]
+    fn fenced_checkboxes_are_not_modified() {
+        let input = "- [ ] real item\n```\n- [ ] fake in fence\n```\n";
+        let dep_states = HashMap::new();
+        let after_refs = update_ref_checkboxes_sync(input, &dep_states);
+        assert_eq!(after_refs, input);
+        let after_nested = update_nested_checkboxes(input);
+        assert_eq!(after_nested, input);
+    }
+
+    #[test]
+    fn parent_ref_not_overridden_by_done_children() {
+        // Parent has @ID (ref not done), child is done. Parent must stay [ ].
+        let input = "- [ ] @1234567890 task\n  - [x] child\n";
+        let dep_states = HashMap::new(); // ref absent → not done
+        let after_refs = update_ref_checkboxes_sync(input, &dep_states);
+        let out = update_nested_checkboxes(&after_refs);
+        assert!(
+            out.starts_with("- [ ]"),
+            "parent with unsatisfied ref must stay unchecked even when children are done"
+        );
+    }
+
+    #[test]
+    fn parent_ref_and_children_both_done_promotes_parent() {
+        // Parent has @ID (ref done), child not done. Parent stays [ ] because child is incomplete.
+        let input = "- [ ] @1234567890 task\n  - [ ] child\n";
+        let dep_states = HashMap::from([("1234567890".to_string(), true)]);
+        let after_refs = update_ref_checkboxes_sync(input, &dep_states);
+        // after_refs: ref becomes [x], child stays [ ]
+        // after nested: child still [ ] → parent should stay [ ] (child not done)
+        let out = update_nested_checkboxes(&after_refs);
+        assert!(
+            out.starts_with("- [ ]"),
+            "parent stays unchecked when ref done but child not done"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ Rust LSP binary for the `~/wiki` Typst-based Zettelkasten.
 ```bash
 cargo build          # dev build
 cargo build --release
-cargo test           # 20 tests across parser, formatting, migrate
+cargo test           # 29 tests across parser, formatting, migrate, reconcile
 cargo test <name>    # run a single test by name (substring match)
 ```
 
@@ -116,6 +116,33 @@ vim.lsp.config("zk-lsp", {
   root_dir = vim.fn.expand("~/wiki"),
 })
 ```
+
+## Checklist Semantics
+
+Two item types exist in checklists:
+
+1. **`LocalItem`** — truth = `item.checked` (source fact; user-authored)
+2. **`RefItem`** (`- [ ] @A @B …`) — truth = `∀ id ∈ target_ids: done_lookup(id)` (all referenced notes must be done; **never** the rendered checkbox)
+
+**Leaf items rule:** Only leaf items participate in note status aggregation. A leaf has no subsequent item with strictly greater indent. Non-leaf LocalItems are derived display views of their children and must not be used as source facts.
+
+**Rendered `[x]` on a RefItem is NEVER a source of truth in the solver** — `dep_states["B"]` is authoritative.
+
+**Note done formula:**
+```
+note.done = ∀ leaf_item ∈ items: eval_item_truth(leaf_item) == true
+          (falls back to metadata.checklist_status when items list is empty)
+```
+
+**Responsibility split:**
+- **Formatter** (`formatting.rs`): current-file normalization + read-only dep_states lookup (trusts reconciled metadata via `is_note_done`); no graph solving. `is_note_done_with_deps` is the canonical semantic evaluator.
+- **Reconcile** (`reconcile.rs`): global SCC solve (Tarjan) + minimum fixed-point (start all-false, monotone false→true) + batch write-back. `compute_node_done` calls `is_note_done_with_deps` directly on raw content.
+- **Cycles** → SCC + minimum fixed point; pure cycles cannot become done without external support.
+
+**Key functions in `src/parser.rs`:**
+- `parse_checklist_items(content)` → `Vec<ChecklistItem>` (skips fenced blocks)
+- `eval_item_truth(item, done_lookup)` → bool
+- `compute_note_done_from_items(items, done_lookup)` → bool (leaf-only)
 
 ## Install
 

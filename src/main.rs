@@ -1,5 +1,7 @@
 mod cli;
 mod config;
+mod cycle;
+mod dependency_graph;
 mod handlers;
 mod index;
 mod link_gen;
@@ -63,12 +65,9 @@ async fn main() -> anyhow::Result<()> {
                 stats.migrated, stats.already_current, stats.skipped
             );
         }
-        Command::Reconcile { dry_run, max_rounds } => {
-            let stats = reconcile::run_reconcile(&config, dry_run, max_rounds).await?;
-            eprintln!(
-                "Reconcile: {} round(s), {} file(s) changed, converged: {}",
-                stats.rounds, stats.files_changed, stats.converged
-            );
+        Command::Reconcile { dry_run } => {
+            let stats = reconcile::run_reconcile(&config, dry_run).await?;
+            eprintln!("Reconcile: {} file(s) changed", stats.files_changed);
         }
     }
     Ok(())
