@@ -3,6 +3,7 @@ mod config;
 mod handlers;
 mod index;
 mod link_gen;
+mod migrate;
 mod note_ops;
 mod parser;
 mod server;
@@ -37,8 +38,8 @@ async fn main() -> anyhow::Result<()> {
             link_gen::generate_link_typ(&config).await?;
             eprintln!("link.typ regenerated at {}", config.link_file.display());
         }
-        Command::New { metadata } => {
-            let path = note_ops::create_note(&config, metadata).await?;
+        Command::New => {
+            let path = note_ops::create_note(&config).await?;
             println!("{}", path.display());
         }
         Command::Remove { id } => {
@@ -52,6 +53,14 @@ async fn main() -> anyhow::Result<()> {
             let formatted =
                 handlers::formatting::format_content(&content, &config.note_dir).await;
             print!("{formatted}");
+        }
+        Command::Migrate => {
+            eprintln!("Migrating legacy notes in {} …", config.note_dir.display());
+            let stats = migrate::migrate_wiki(&config).await?;
+            eprintln!(
+                "Done: {} migrated, {} already current, {} skipped.",
+                stats.migrated, stats.already_current, stats.skipped
+            );
         }
     }
     Ok(())

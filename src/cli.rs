@@ -20,11 +20,7 @@ pub enum Command {
     /// Regenerate link.typ from the note directory
     Generate,
     /// Create a new note and print its path to stdout
-    New {
-        /// Include metadata block in the new note
-        #[arg(long)]
-        metadata: bool,
-    },
+    New,
     /// Delete a note and remove it from link.typ
     Remove {
         /// The 10-digit note ID (YYMMDDHHMM)
@@ -32,4 +28,6 @@ pub enum Command {
     },
     /// Format a note: read from stdin, write formatted content to stdout
     Format,
+    /// Migrate legacy comment-format notes to TOML schema v1
+    Migrate,
 }
