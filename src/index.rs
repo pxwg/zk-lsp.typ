@@ -14,7 +14,9 @@ pub struct NoteInfo {
     pub title: String,
     pub archived: bool,
     pub legacy: bool,
+    #[allow(dead_code)]
     pub alt_id: Option<String>,
+    #[allow(dead_code)]
     pub evo_id: Option<String>,
     pub relation_target: Vec<String>,
     pub aliases: Vec<String>,
