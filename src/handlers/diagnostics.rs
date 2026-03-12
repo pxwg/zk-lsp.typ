@@ -305,6 +305,50 @@ pub fn get_orphan_diagnostic(
     })
 }
 
+/// Generate WARNING diagnostics for Ref checklist items that are non-leaf nodes.
+///
+/// A RefItem (`- [ ] @ID`) must always be a leaf. If it has child items (next item
+/// with strictly greater indent), the @ID targets will be semantically ignored by
+/// the leaf rule, silently breaking the dependency.
+pub fn get_checklist_diagnostics(content: &str) -> Vec<Diagnostic> {
+    let items = parser::parse_checklist_items(content);
+    let lines: Vec<&str> = content.lines().collect();
+    let mut diagnostics = Vec::new();
+
+    for (i, item) in items.iter().enumerate() {
+        let parser::ChecklistItemKind::Ref { targets } = &item.kind else { continue };
+        let is_non_leaf = i + 1 < items.len() && items[i + 1].indent > item.indent;
+        if !is_non_leaf {
+            continue;
+        }
+
+        let line_text = lines.get(item.line_idx).copied().unwrap_or("");
+        let (start_byte, end_byte) = targets
+            .first()
+            .zip(targets.last())
+            .map(|(f, l)| (f.byte_start as usize, l.byte_end as usize))
+            .unwrap_or((0, line_text.len()));
+
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position {
+                    line: item.line_idx as u32,
+                    character: parser::byte_to_utf16(line_text, start_byte),
+                },
+                end: Position {
+                    line: item.line_idx as u32,
+                    character: parser::byte_to_utf16(line_text, end_byte),
+                },
+            },
+            severity: Some(DiagnosticSeverity::WARNING),
+            source: Some("zk-lsp".into()),
+            message: "Ref item has child items; @ID targets will be semantically ignored (only leaf items are source facts)".into(),
+            ..Default::default()
+        });
+    }
+    diagnostics
+}
+
 /// Generate LSP diagnostics for `@ID` occurrences that participate in cycles.
 ///
 /// Filters `cycles` to only occurrences whose `file_path` matches `file_path`.
@@ -432,6 +476,33 @@ mod tests {
         let content = "= My Note <1111111111>\n- [ ] @2222222222\n";
         let diag = get_orphan_diagnostic(content, "/wiki/note/1111111111.typ", &index);
         assert!(diag.is_none());
+    }
+
+    #[test]
+    fn test_non_leaf_ref_item_produces_warning() {
+        // - [ ] @1111111111   ← Ref, non-leaf (has child)
+        //   - [ ] description ← Local, leaf
+        let content = "- [ ] @1111111111\n  - [ ] description\n";
+        let diags = get_checklist_diagnostics(content);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    #[test]
+    fn test_leaf_ref_item_no_warning() {
+        // - [ ] description   ← Local parent
+        //   - [ ] @1111111111 ← Ref, leaf child
+        let content = "- [ ] description\n  - [ ] @1111111111\n";
+        let diags = get_checklist_diagnostics(content);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn test_local_parent_no_warning() {
+        // LocalItem with children is fine
+        let content = "- [ ] parent\n  - [ ] child\n";
+        let diags = get_checklist_diagnostics(content);
+        assert!(diags.is_empty());
     }
 
     #[test]

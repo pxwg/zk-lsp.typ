@@ -58,6 +58,7 @@ impl ZkLspServer {
         let mut diags = diagnostics::get_diagnostics(content, &self.index, uri.path());
         diags.extend(diagnostics::get_cycle_diagnostics(content, &file_path, &cycles));
         diags.extend(diagnostics::get_schema_diagnostics(content, &self.index));
+        diags.extend(diagnostics::get_checklist_diagnostics(content));
         if let Some(d) = diagnostics::get_orphan_diagnostic(content, uri.path(), &self.index) {
             diags.push(d);
         }
