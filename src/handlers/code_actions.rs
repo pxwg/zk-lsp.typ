@@ -140,19 +140,7 @@ pub fn get_metadata_actions(
                     },
                     new_text: format!("  relation = \"{new_rel}\""),
                 });
-                if let Some(rt_line) = relation_target_line_idx {
-                    let rt_text = lines.get(rt_line).copied().unwrap_or("");
-                    edits.push(TextEdit {
-                        range: Range {
-                            start: Position { line: rt_line as u32, character: 0 },
-                            end: Position {
-                                line: rt_line as u32,
-                                character: rt_text.len() as u32,
-                            },
-                        },
-                        new_text: "  relation-target = [\"\"]".to_string(),
-                    });
-                } else {
+                if relation_target_line_idx.is_none() {
                     // Insert new line after relation line
                     edits.push(TextEdit {
                         range: Range {
@@ -179,7 +167,7 @@ pub fn get_metadata_actions(
                 }));
             }
         } else {
-            // Mark as active: clear relation-target
+            // Mark as active: preserve existing relation-target values
             let mut edits = Vec::new();
             edits.push(TextEdit {
                 range: Range {
@@ -191,16 +179,6 @@ pub fn get_metadata_actions(
                 },
                 new_text: "  relation = \"active\"".to_string(),
             });
-            if let Some(rt_line) = relation_target_line_idx {
-                let rt_text = lines.get(rt_line).copied().unwrap_or("");
-                edits.push(TextEdit {
-                    range: Range {
-                        start: Position { line: rt_line as u32, character: 0 },
-                        end: Position { line: rt_line as u32, character: rt_text.len() as u32 },
-                    },
-                    new_text: "  relation-target = []".to_string(),
-                });
-            }
             let workspace_edit = WorkspaceEdit {
                 changes: Some([(uri.clone(), edits)].into_iter().collect()),
                 ..Default::default()
@@ -225,16 +203,7 @@ pub fn get_metadata_actions(
                 },
                 new_text: format!("  relation = \"{other_rel}\""),
             });
-            if let Some(rt_line) = relation_target_line_idx {
-                let rt_text = lines.get(rt_line).copied().unwrap_or("");
-                edits.push(TextEdit {
-                    range: Range {
-                        start: Position { line: rt_line as u32, character: 0 },
-                        end: Position { line: rt_line as u32, character: rt_text.len() as u32 },
-                    },
-                    new_text: "  relation-target = [\"\"]".to_string(),
-                });
-            } else {
+            if relation_target_line_idx.is_none() {
                 edits.push(TextEdit {
                     range: Range {
                         start: Position { line: rel_file_line as u32 + 1, character: 0 },
@@ -278,6 +247,20 @@ mod tests {
         "= Test Note <2603110000>\n",
     );
 
+    const NOTE_TOML_ACTIVE_NO_TARGET: &str = concat!(
+        "#import \"../include.typ\": *\n",
+        "#let zk-metadata = toml(bytes(\n",
+        "  ```toml\n",
+        "  schema-version = 1\n",
+        "  checklist-status = \"none\"\n",
+        "  relation = \"active\"\n",
+        "  ```.text,\n",
+        "))\n",
+        "#show: zettel.with(metadata: zk-metadata)\n",
+        "\n",
+        "= Test Note <2603110000>\n",
+    );
+
     const NOTE_TOML_ARCHIVED: &str = concat!(
         "#import \"../include.typ\": *\n",
         "#let zk-metadata = toml(bytes(\n",
@@ -291,6 +274,21 @@ mod tests {
         "#show: zettel.with(metadata: zk-metadata)\n",
         "\n",
         "= Test Note <2603110002>\n",
+    );
+
+    const NOTE_TOML_ACTIVE_WITH_TARGETS: &str = concat!(
+        "#import \"../include.typ\": *\n",
+        "#let zk-metadata = toml(bytes(\n",
+        "  ```toml\n",
+        "  schema-version = 1\n",
+        "  checklist-status = \"none\"\n",
+        "  relation = \"active\"\n",
+        "  relation-target = [\"2603110001\", \"2603110002\"]\n",
+        "  ```.text,\n",
+        "))\n",
+        "#show: zettel.with(metadata: zk-metadata)\n",
+        "\n",
+        "= Test Note <2603110000>\n",
     );
 
     fn make_uri() -> Url {
@@ -335,7 +333,7 @@ mod tests {
     #[test]
     fn test_metadata_actions_mark_archived_inserts_relation_target() {
         let uri = make_uri();
-        let actions = get_metadata_actions(&uri, NOTE_TOML_ACTIVE, inside_block_range());
+        let actions = get_metadata_actions(&uri, NOTE_TOML_ACTIVE_NO_TARGET, inside_block_range());
         let archived_action = actions.iter().find_map(|a| {
             if let CodeActionOrCommand::CodeAction(ca) = a {
                 if ca.title.contains("archived") {
@@ -392,6 +390,44 @@ mod tests {
             None
         });
         assert!(mark_legacy.is_some(), "Mark as legacy action must exist when currently archived");
+    }
+
+    #[test]
+    fn test_metadata_actions_mark_active_preserves_existing_relation_targets() {
+        let uri = Url::parse("file:///wiki/note/2603110002.typ").unwrap();
+        let range = Range {
+            start: Position { line: 5, character: 0 },
+            end: Position { line: 5, character: 0 },
+        };
+        let actions = get_metadata_actions(&uri, NOTE_TOML_ARCHIVED, range);
+        let mark_active = actions.iter().find_map(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) if ca.title == "ZK: Mark as active" => Some(ca),
+            _ => None,
+        });
+        let edits = mark_active
+            .and_then(|ca| ca.edit.as_ref())
+            .and_then(|e| e.changes.as_ref())
+            .and_then(|c| c.values().next())
+            .unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "  relation = \"active\"");
+    }
+
+    #[test]
+    fn test_metadata_actions_mark_archived_preserves_existing_relation_targets() {
+        let uri = make_uri();
+        let actions = get_metadata_actions(&uri, NOTE_TOML_ACTIVE_WITH_TARGETS, inside_block_range());
+        let archived_action = actions.iter().find_map(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) if ca.title == "ZK: Mark as archived" => Some(ca),
+            _ => None,
+        });
+        let edits = archived_action
+            .and_then(|ca| ca.edit.as_ref())
+            .and_then(|e| e.changes.as_ref())
+            .and_then(|c| c.values().next())
+            .unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "  relation = \"archived\"");
     }
 }
 
