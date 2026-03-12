@@ -7,22 +7,43 @@ use tokio::fs;
 use crate::config::WikiConfig;
 use crate::link_gen;
 
+const DEFAULT_METADATA_BLOCK: &str = "#let zk-metadata = toml(bytes(\n \
+  ```toml\n \
+  schema-version = 1\n \
+  aliases = []\n \
+  abstract = \"\"\n \
+  keywords = []\n \
+  generated = true\n \
+  checklist-status = \"none\"\n \
+  relation = \"active\"\n \
+  relation-target = []\n \
+  ```.text,\n\
+))";
+
+fn build_note_content(id: &str, config: &WikiConfig) -> String {
+    if let Some(tmpl) = &config.zk_config.new_note_template {
+        return tmpl
+            .replace("{{id}}", id)
+            .replace("{{metadata}}", DEFAULT_METADATA_BLOCK);
+    }
+    format!(
+        "#import \"../include.typ\": *\n\
+         {DEFAULT_METADATA_BLOCK}\n\
+         #show: zettel.with(metadata: zk-metadata)\n\
+         \n\
+         =  <{id}>\n"
+    )
+}
+
 /// Create a new note with the current timestamp as ID.
 /// Returns the path to the new file.
-pub async fn create_note(config: &WikiConfig, with_metadata: bool) -> Result<PathBuf> {
+pub async fn create_note(config: &WikiConfig) -> Result<PathBuf> {
     let id = Local::now().format("%y%m%d%H%M").to_string();
     fs::create_dir_all(&config.note_dir).await?;
 
     let path = config.note_dir.join(format!("{id}.typ"));
     if !path.exists() {
-        let content = if with_metadata {
-            format!(
-                "/* Metadata:\nAliases: \nAbstract: \nKeyword: \nGenerated: true\n*/\n\
-                 #import \"../include.typ\": *\n#show: zettel\n\n=  <{id}>\n#tag.\n\n"
-            )
-        } else {
-            format!("#import \"../include.typ\": *\n#show: zettel\n\n=  <{id}>\n#tag.\n\n")
-        };
+        let content = build_note_content(&id, config);
         fs::write(&path, &content)
             .await
             .with_context(|| format!("writing note {}", path.display()))?;

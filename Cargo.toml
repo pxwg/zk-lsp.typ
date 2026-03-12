@@ -1,7 +1,8 @@
 [package]
 name = "zk-lsp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+license = "AGPL-3.0"
 
 [[bin]]
 name = "zk-lsp"
@@ -22,3 +23,5 @@ url = "2"
 chrono = "0.4"
 dashmap = "5"
 anyhow = "1"
+toml = "0.8"
+unicode-width = "0.2"

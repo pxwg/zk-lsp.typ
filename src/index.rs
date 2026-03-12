@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use tokio::fs;
 
 use crate::config::WikiConfig;
-use crate::parser;
+use crate::parser::{self, ChecklistStatus};
 
 #[derive(Debug, Clone)]
 pub struct NoteInfo {
@@ -16,9 +16,12 @@ pub struct NoteInfo {
     pub legacy: bool,
     pub alt_id: Option<String>,
     pub evo_id: Option<String>,
+    pub relation_target: Vec<String>,
     pub aliases: Vec<String>,
     pub keywords: Vec<String>,
     pub abstract_text: Option<String>,
+    #[allow(dead_code)]
+    pub checklist_status: Option<ChecklistStatus>,
     pub path: PathBuf,
 }
 
@@ -131,9 +134,11 @@ impl NoteIndex {
                 legacy: header.legacy,
                 alt_id: header.alt_id.clone(),
                 evo_id: header.evo_id.clone(),
+                relation_target: header.relation_target.clone(),
                 aliases: header.aliases.clone(),
                 keywords: header.keywords.clone(),
                 abstract_text: header.abstract_text.clone(),
+                checklist_status: header.checklist_status.clone(),
                 path: path.to_path_buf(),
             };
             self.notes.insert(header.id.clone(), info);
@@ -143,7 +148,7 @@ impl NoteIndex {
         // Convert byte offsets to UTF-16 code-unit offsets (required by LSP) here,
         // while the line text is available.
         let lines: Vec<&str> = content.lines().collect();
-        let refs = parser::find_all_refs(&content);
+        let refs = parser::find_all_refs_filtered(&content);
         for r in refs {
             let line_text = lines.get(r.line as usize).copied().unwrap_or("");
             let loc = BacklinkLocation {
