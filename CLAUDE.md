@@ -11,7 +11,7 @@ Rust LSP binary for the `~/wiki` Typst-based Zettelkasten.
 ```bash
 cargo build          # dev build
 cargo build --release
-cargo test           # 51 tests across parser, formatting, migrate, reconcile, cycle, diagnostics, code_actions, completion
+cargo test           # 60 tests across parser, formatting, migrate, reconcile, cycle, diagnostics, code_actions, completion, graph_check, context_export
 cargo test <name>    # run a single test by name (substring match)
 ```
 
@@ -27,6 +27,8 @@ zk-lsp remove <ID> [--wiki-root PATH]  # delete note + remove from link.typ
 zk-lsp format                       # read note from stdin, write formatted to stdout
 zk-lsp migrate [--wiki-root PATH]   # migrate legacy comment-format notes to TOML schema v1
 zk-lsp reconcile [--wiki-root PATH] [--dry-run]  # reconcile cross-file checkbox states
+zk-lsp export <ID> [--depth N]      # BFS context export to Markdown (default depth: 2)
+zk-lsp check [--no-orphans] [--no-dead-links]  # graph integrity: dead links + orphans; exits 1 on dead links
 ```
 
 `WIKI_ROOT` env overrides the `~/wiki` default. `--wiki-root` overrides `WIKI_ROOT`.
@@ -99,6 +101,8 @@ src/
 ├── dependency_graph.rs   build_dependency_graph: RefItem → positioned edge list
 ├── cycle.rs              detect_cycles (Tarjan SCC) + render_cycle_errors (CLI)
 ├── reconcile.rs          single-pass DAG eval + batch write-back; fails on cycles
+├── graph_check.rs        check_graph (dead links + orphans) + render_check_report (CLI)
+├── context_export.rs     export_context: BFS Markdown for AI consumption
 ├── index.rs              NoteIndex (DashMap notes + backlinks)
 ├── link_gen.rs           link.typ generation and entry management
 ├── migrate.rs            migrate_wiki / migrate_note (legacy → TOML v1)
@@ -107,7 +111,7 @@ src/
 ├── watcher.rs            notify-debouncer-mini (300 ms) on note_dir
 └── handlers/
     ├── references.rs    find_references (uses backlink index)
-    ├── diagnostics.rs   archived/legacy warnings; cycle, schema diagnostics
+    ├── diagnostics.rs   dead link ERROR + archived/legacy/orphan/cycle/schema diagnostics
     ├── code_actions.rs  quick-fixes + metadata toggle actions (checklist-status, relation)
     ├── completion.rs    TOML metadata completions (enum values, note IDs, field names)
     ├── inlay_hints.rs   @ID → title after cursor
@@ -158,8 +162,32 @@ note.done = ∀ leaf_item ∈ items: eval_item_truth(leaf_item) == true
 - `cycle::render_cycle_errors(cycles)` → `String` (CLI; byte columns, ANSI colour, CJK width)
 - `diagnostics::get_cycle_diagnostics(content, path, cycles)` → `Vec<Diagnostic>` (LSP; UTF-16)
 - `diagnostics::get_schema_diagnostics(content, index)` → `Vec<Diagnostic>` (validates TOML metadata fields)
+- `diagnostics::get_orphan_diagnostic(content, uri_path, index)` → `Option<Diagnostic>` (HINT if note has no backlinks)
+- `graph_check::check_graph(config)` → `CheckReport` (dead links + orphans across whole wiki)
+- `graph_check::render_check_report(report)` → `String` (Typst-error style CLI output; stdout TTY-aware)
+- `context_export::export_context(entry_id, depth, config)` → `String` (BFS Markdown document)
 - `code_actions::get_metadata_actions(uri, content, range)` → `Vec<CodeActionOrCommand>` (checklist-status toggle, relation switch)
 - `completion::get_completions(content, position, index)` → `Vec<CompletionItem>` (TOML enum values, note IDs, field names)
+
+## LSP Commands
+
+| Command | Arguments | Returns |
+|---------|-----------|---------|
+| `zk.newNote` | — | — |
+| `zk.removeNote` | `id: string` | — |
+| `zk.generateLinkTyp` | — | — |
+| `zk.exportContext` | `id: string, depth?: number` | `string` (Markdown) |
+
+## Diagnostics Summary
+
+| Source | Severity | Trigger |
+|--------|----------|---------|
+| dead `@ID` ref | ERROR | referenced note does not exist in index |
+| cycle | ERROR | `@ID` participates in a task-dependency cycle |
+| orphan note | HINT | note has no inbound `@ID` references |
+| archived `@ID` | WARNING | referenced note has `relation = "archived"` |
+| legacy `@ID` | INFORMATION | referenced note has `relation = "legacy"` |
+| schema | ERROR/WARNING | invalid TOML field values or missing `relation-target` |
 
 ## Install
 
