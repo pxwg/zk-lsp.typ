@@ -7,7 +7,7 @@ use tower_lsp::{Client, LanguageServer};
 use tracing::{error, info};
 
 use crate::config::WikiConfig;
-use crate::handlers::{code_actions, completion, diagnostics, inlay_hints, references};
+use crate::handlers::{code_actions, completion, diagnostics, hover, inlay_hints, references};
 use crate::index::NoteIndex;
 use crate::{cycle, dependency_graph, link_gen, note_ops, watcher};
 
@@ -93,6 +93,7 @@ impl LanguageServer for ZkLspServer {
                     resolve_provider: Some(false),
                     ..Default::default()
                 }),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 execute_command_provider: Some(ExecuteCommandOptions {
@@ -248,6 +249,21 @@ impl LanguageServer for ZkLspServer {
             .unwrap_or_default();
         let items = completion::get_completions(&content, position, &self.index);
         Ok(if items.is_empty() { None } else { Some(CompletionResponse::Array(items)) })
+    }
+
+    // -----------------------------------------------------------------------
+    // Hover
+    // -----------------------------------------------------------------------
+
+    async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let content = uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        Ok(hover::get_hover(&content, position, &self.index))
     }
 
     // -----------------------------------------------------------------------
