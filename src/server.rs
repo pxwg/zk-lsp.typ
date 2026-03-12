@@ -7,7 +7,9 @@ use tower_lsp::{Client, LanguageServer};
 use tracing::{error, info};
 
 use crate::config::WikiConfig;
-use crate::handlers::{code_actions, completion, diagnostics, hover, inlay_hints, references};
+use crate::handlers::{
+    code_actions, completion, definition, diagnostics, hover, inlay_hints, references,
+};
 use crate::index::NoteIndex;
 use crate::{cycle, dependency_graph, link_gen, note_ops, watcher};
 
@@ -86,6 +88,7 @@ impl LanguageServer for ZkLspServer {
                         will_save_wait_until: None,
                     },
                 )),
+                definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
@@ -197,6 +200,26 @@ impl LanguageServer for ZkLspServer {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Definition
+    // -----------------------------------------------------------------------
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> LspResult<Option<GotoDefinitionResponse>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let content = uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+
+        Ok(definition::get_definition(&content, position, &self.index)
+            .map(GotoDefinitionResponse::Scalar))
     }
 
     // -----------------------------------------------------------------------
