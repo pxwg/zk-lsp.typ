@@ -8,7 +8,7 @@ Replaces the Lua/Python automation in `~/wiki` with a single compiled binary tha
 - **Diagnostics** — warnings for archived references, info for legacy references, errors for cyclic dependencies
 - **Code actions** — quick-fix to replace or append the successor note ID
 - **References** — find every file that links to the note under the cursor
-- **Tag formatter** — `zk-lsp format` normalizes checkbox states and `#tag.todo/wip/done` for a single note
+- **Tag formatter** — `zk-lsp format` normalizes checkbox states and `checklist-status` tags based on on-disk metadata
 - **Reconcile** — `zk-lsp reconcile` propagates done-states across the whole wiki in a single topological pass
 - **Cycle detection** — cyclic `@ID` task dependencies are a hard error (CLI + LSP diagnostics)
 - **Migration** — `zk-lsp migrate` converts legacy comment-format notes to TOML schema v1
@@ -58,7 +58,7 @@ generated = false
 // Content goes here
 `````
 
-~Legacy comment-format notes are read-only. Run `zk-lsp migrate` to convert them to TOML schema v1.~
+You can define your own template for `zk-lsp new` in the [configuration](#configuration) section below.
 
 ## CLI
 
@@ -211,19 +211,18 @@ The server advertises these capabilities:
 
 **Legacy suppression**: if a legacy reference is immediately followed by its evolution ID on the same line (`@old @new`), the diagnostic is suppressed.
 
-## Tag Formatter
+## Tag Formatter and Task Checker
 
 `zk-lsp format` reads a note from stdin and writes the normalized content to stdout. It:
 
 1. Ticks or unticks `- [ ] @<id>` checkboxes based on whether all referenced notes are done (reads on-disk `checklist-status` set by `reconcile`)
-2. Propagates parent checkbox state from children (nested lists)
-3. Updates the `#tag.todo/wip/done` status line
+2. Updates the `checklist-status` status line in the current note's metadata (`none`, `active`, `done`)
 
 | Checkbox state | Tag |
 |---|---|
-| All incomplete | `#tag.todo` |
-| Mixed | `#tag.wip` |
-| All complete | `#tag.done` |
+| All incomplete | `todo`
+| Mixed | `wip` |
+| All complete | `done` |
 
 ## Reconcile
 
@@ -235,6 +234,50 @@ The server advertises these capabilities:
 4. Writes back only changed notes (updates `checklist-status` in TOML metadata)
 
 Use `--dry-run` to preview changes without writing files.
+
+## Example Usages
+
+### Note Taking 
+
+This is the basic use case: you create notes with `zk-lsp new`, write down your thoughts, and link them together with `@ID` references. The LSP features help you navigate and maintain the wiki as it grows:
+- Jump to reference of `<ID>` to quickly find which notes link to the current one
+- (Using [Tinymist LSP](https://github.com/Myriad-Dreamin/tinymist)) to jump to definition of `@ID` references to read the source note without leaving the current context
+- When you delete or move notes around, `zk-lsp generate` keeps `link.typ` up to date with the current note graph
+- Inlay hints show note titles inline, so you can read `@2602082037` as `@2602082037 (Note Title)`
+
+### Life Cycle of a Task Note
+
+You can use zettelkasten notes as task management tools by adding checklist entries that reference other notes, e.g.:
+```typ
+- [ ] Task 1
+  - [ ] Subtask 1.1 @id
+  - [ ] Subtask 1.2
+```
+`zk-lsp` helps you manage these task notes by tracking their done-states based on the checklist entries and propagating changes across the wiki with `reconcile`. A typical workflow might look like this:
+
+1. `zk-lsp new` creates a note with `checklist-status = "none"` and no checklist entries
+2. The user adds `- [ ]` or `- [ ] @B` entries to the note body
+  - If any `@ID` references are added, this checkbox would not be considered done until the referenced note's `checklist-status` is `done`
+3. `zk-lsp format` updates `checklist-status` to `active` and adds the `#tag.todo` tag
+4. When all checkboxes are ticked, `zk-lsp format` updates `checklist-status` to `done`, replaces `checklist-status = "active"` with `checklist-status = "done"` in the metadata
+5. When an idea is no longer useful, e.g.:
+  - The note is superseded by a newer version: changing the metadata from `relation = "active"` to `relation = "legacy"`, and optionally adding some relation notes with `relation-target = ["<id1>",...]` to point to the newer insights
+  - The note is manually archived by the user: changing the metadata to `checklist-status = "archived"` and optionally adding `relation-target = ["<id1>",...]` to point to the successor note(s)
+  - The action above could be simplified with:
+    - A code action on the note to mark it as legacy, archived or active
+    - A completion for adding `relation-target` entries that lists note titles for easy linking
+    - A [Diagnostic](#diagnostics) warning when an archived/legacy note is referenced, and a quick-fix to update the reference to the successor note
+
+Cyclic dependencies of sub-tasks are not allowed: it makes no sense for such configuration:
+```typ
+// Note A
+- [ ] Task A.1 @B
+```
+```typ
+// Note B
+- [ ] Task B.1 @A
+```
+In this case, `zk-lsp` will report a hard error with the involved file locations when you run `reconcile`, and the LSP server will report an error diagnostic on every involved `@ID` reference.
 
 ## Environment
 
