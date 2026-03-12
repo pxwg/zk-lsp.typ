@@ -236,4 +236,4 @@ Use `--dry-run` to preview changes without writing files.
 
 ## License
 
-MIT
+GNU Affero General Public License v3 (AGPL-3.0)
