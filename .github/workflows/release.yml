@@ -11,12 +11,14 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: x86_64-apple-darwin
-            os: macos-13
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
+            native: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            native: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             cross: true
@@ -37,7 +39,7 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Run tests (native targets only)
-        if: '!matrix.cross'
+        if: matrix.native
         run: cargo test
 
       - name: Build release binary
