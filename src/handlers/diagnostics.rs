@@ -131,9 +131,38 @@ fn extract_toml_string_value(trimmed_line: &str) -> Option<&str> {
 
 /// Validate TOML metadata block fields and produce diagnostics.
 pub fn get_schema_diagnostics(content: &str, index: &Arc<NoteIndex>) -> Vec<Diagnostic> {
+    let lines: Vec<&str> = content.lines().collect();
     let Some(block) = parser::find_toml_metadata_block(content) else {
-        return Vec::new();
+        return vec![Diagnostic {
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: lines.first().map(|l| l.len()).unwrap_or(0) as u32 },
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some("zk-lsp".into()),
+            message: "Missing `zk-metadata` TOML block".to_string(),
+            ..Default::default()
+        }];
     };
+
+    let title_line_idx = lines
+        .iter()
+        .enumerate()
+        .skip(block.end_line + 1)
+        .find_map(|(idx, line)| parser::RE_TITLE.is_match(line).then_some(idx));
+
+    if title_line_idx.is_none() {
+        return vec![Diagnostic {
+            range: Range {
+                start: Position { line: block.end_line as u32, character: 0 },
+                end: Position { line: block.end_line as u32, character: 0 },
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some("zk-lsp".into()),
+            message: "Missing note title heading (`= Title <ID>`)".to_string(),
+            ..Default::default()
+        }];
+    }
 
     // Try to parse as TOML; if invalid, return a single parse-error diagnostic
     if let Err(e) = block.toml_content.parse::<toml::Value>() {
@@ -150,7 +179,6 @@ pub fn get_schema_diagnostics(content: &str, index: &Arc<NoteIndex>) -> Vec<Diag
     }
 
     let mut diagnostics = Vec::new();
-    let lines: Vec<&str> = content.lines().collect();
     let toml_line_count = block.toml_content.lines().count();
     let toml_start = block.end_line.saturating_sub(toml_line_count);
     let expected_fields = [
@@ -518,6 +546,46 @@ mod tests {
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
         assert!(diags[0].message.contains("does not exist"));
+    }
+
+    #[test]
+    fn test_missing_metadata_block_produces_error() {
+        let index = make_index();
+        let content = concat!(
+            "#import \"../include.typ\": *\n",
+            "#show: zettel.with(metadata: zk-metadata)\n",
+            "\n",
+            "= Note <2603110000>\n",
+        );
+        let diags = get_schema_diagnostics(content, &index);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(diags[0].message, "Missing `zk-metadata` TOML block");
+    }
+
+    #[test]
+    fn test_missing_title_heading_produces_error() {
+        let index = make_index();
+        let content = concat!(
+            "#import \"../include.typ\": *\n",
+            "#let zk-metadata = toml(bytes(\n",
+            "  ```toml\n",
+            "  schema-version = 1\n",
+            "  aliases = []\n",
+            "  abstract = \"\"\n",
+            "  keywords = []\n",
+            "  generated = true\n",
+            "  checklist-status = \"none\"\n",
+            "  relation = \"active\"\n",
+            "  relation-target = []\n",
+            "  ```.text,\n",
+            "))\n",
+            "#show: zettel.with(metadata: zk-metadata)\n",
+        );
+        let diags = get_schema_diagnostics(content, &index);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(diags[0].message, "Missing note title heading (`= Title <ID>`)");
     }
 
     #[test]
