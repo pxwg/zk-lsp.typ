@@ -581,6 +581,49 @@ pub fn find_all_refs_filtered(content: &str) -> Vec<RefOccurrence> {
     refs
 }
 
+/// A heading parsed from note content (outside TOML block and fenced code).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct Heading {
+    pub level: u32,
+    pub text: String,
+    pub line_idx: usize,
+}
+
+/// Parse all headings from `content`, skipping the TOML metadata block and fenced code blocks.
+/// For the title heading (matching `= Title <YYMMDDHHMM>`), the ` <ID>` suffix is stripped.
+#[allow(dead_code)]
+pub fn parse_headings(content: &str) -> Vec<Heading> {
+    static RE_HEADING: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(=+)\s+(.+)").unwrap());
+    static RE_ID_SUFFIX: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+<\d{10}>$").unwrap());
+
+    let toml_range = find_toml_metadata_block(content).map(|b| b.start_line..=b.end_line);
+    let mut headings = Vec::new();
+    let mut in_fence = false;
+
+    for (line_idx, line) in content.lines().enumerate() {
+        if let Some(ref range) = toml_range {
+            if range.contains(&line_idx) {
+                continue;
+            }
+        }
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if let Some(cap) = RE_HEADING.captures(line) {
+            let level = cap[1].len() as u32;
+            let raw_text = cap[2].trim().to_string();
+            let text = RE_ID_SUFFIX.replace(&raw_text, "").to_string();
+            headings.push(Heading { level, text, line_idx });
+        }
+    }
+    headings
+}
+
 /// Compute the status tag based on todo counts and archived flag.
 pub fn compute_status_tag(todos: &TodoStatus, has_archived: bool) -> Option<StatusTag> {
     let has_todos = todos.completed > 0 || todos.incomplete > 0;

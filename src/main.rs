@@ -1,6 +1,8 @@
 mod cli;
 mod config;
 mod context_export;
+#[allow(dead_code)]
+mod hooks;
 mod cycle;
 mod dependency_graph;
 mod graph_check;

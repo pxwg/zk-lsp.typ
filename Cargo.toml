@@ -25,6 +25,7 @@ dashmap = "5"
 anyhow = "1"
 toml = "0.8"
 unicode-width = "0.2"
+mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"

@@ -6,6 +6,103 @@ use regex::Regex;
 use tower_lsp::lsp_types::*;
 
 use crate::parser::{self, StatusTag, ChecklistStatus};
+use crate::hooks::lua::{HookRunner, build_hook_note_input};
+use crate::hooks::apply::apply_hook_result;
+
+/// Default formatter hooks, embedded at compile time from examples/.
+const DEFAULT_CHECKLIST_HOOK: &str =
+    include_str!("../../examples/hooks/checklist.lua");
+const DEFAULT_RELATION_HOOK: &str =
+    include_str!("../../examples/hooks/relation_status.lua");
+
+#[allow(dead_code)]
+/// Apply a list of byte-range edits to `content`.
+///
+/// Each edit is `(start_byte, end_byte, replacement_text)`.
+/// Edits must be non-overlapping. They are applied from last to first so byte
+/// offsets remain valid throughout.
+///
+/// Returns `Err` if any edit is invalid (out of bounds, inverted range, or overlap).
+pub fn apply_byte_edits(content: &str, edits: &[(usize, usize, String)]) -> anyhow::Result<String> {
+    let len = content.len();
+    for (start, end, _) in edits {
+        anyhow::ensure!(start <= end, "edit has start ({start}) > end ({end})");
+        anyhow::ensure!(*end <= len, "edit end ({end}) out of bounds (len={len})");
+    }
+    // Sort by start ascending, check no overlaps
+    let mut sorted: Vec<&(usize, usize, String)> = edits.iter().collect();
+    sorted.sort_by_key(|(s, _, _)| *s);
+    for w in sorted.windows(2) {
+        anyhow::ensure!(
+            w[0].1 <= w[1].0,
+            "edits overlap: [{}, {}) and [{}, {})",
+            w[0].0, w[0].1, w[1].0, w[1].1
+        );
+    }
+    // Apply in reverse order so earlier byte offsets remain valid
+    let mut result = content.to_string();
+    for (start, end, text) in sorted.iter().rev() {
+        result.replace_range(start..end, text);
+    }
+    Ok(result)
+}
+
+/// Render a `toml::Value` as an inline TOML literal (no newlines).
+/// Used by `apply_metadata_patch` for targeted in-place key replacement.
+fn toml_value_inline(value: &toml::Value) -> anyhow::Result<String> {
+    match value {
+        toml::Value::String(s) => {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            Ok(format!("\"{escaped}\""))
+        }
+        toml::Value::Integer(n) => Ok(n.to_string()),
+        toml::Value::Float(f) => Ok(f.to_string()),
+        toml::Value::Boolean(b) => Ok(b.to_string()),
+        toml::Value::Array(arr) => {
+            let items: Vec<String> =
+                arr.iter().map(toml_value_inline).collect::<anyhow::Result<_>>()?;
+            Ok(format!("[{}]", items.join(", ")))
+        }
+        _ => anyhow::bail!("nested TOML tables are not supported in a metadata patch"),
+    }
+}
+
+/// Apply a metadata patch to a TOML-format note using targeted in-place replacement.
+///
+/// For each `(key, value)` in `patch`, finds the key's line within the TOML block
+/// and replaces only that line — preserving key order, indentation, and all other lines.
+/// Returns `Err` if the note has no TOML metadata block or a key is not found in the block.
+pub fn apply_metadata_patch(
+    content: &str,
+    patch: &HashMap<String, toml::Value>,
+) -> anyhow::Result<String> {
+    let block = parser::find_toml_metadata_block(content)
+        .ok_or_else(|| anyhow::anyhow!("no TOML metadata block found"))?;
+
+    let lines: Vec<&str> = content.lines().collect();
+    let trailing_newline = content.ends_with('\n');
+    let mut result_lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+
+    'patch: for (key, value) in patch {
+        let val_str = toml_value_inline(value)?;
+        for i in block.start_line..=block.end_line {
+            let line = lines[i];
+            let trimmed = line.trim_start();
+            if trimmed.starts_with(&format!("{key} =")) || trimmed.starts_with(&format!("{key}=")) {
+                let indent_len = line.len() - trimmed.len();
+                result_lines[i] = format!("{}{key} = {val_str}", " ".repeat(indent_len));
+                continue 'patch;
+            }
+        }
+        anyhow::bail!("key '{key}' not found in TOML metadata block");
+    }
+
+    let mut out = result_lines.join("\n");
+    if trailing_newline {
+        out.push('\n');
+    }
+    Ok(out)
+}
 
 static RE_TODO_ID: Lazy<Regex> = Lazy::new(|| Regex::new(r"@(\d{10})").unwrap());
 
@@ -53,6 +150,7 @@ pub fn is_note_done_with_deps(content: &str, deps: &HashMap<String, bool>) -> bo
     parser::compute_note_done_from_items(&items, &|id| deps.get(id).copied().unwrap_or(false))
 }
 
+#[allow(dead_code)]
 /// Best-effort done check for reading dependency notes (formatter path).
 ///
 /// Trusts explicit `checklist-status` metadata written by `reconcile` first.
@@ -134,52 +232,50 @@ fn update_ref_checkboxes_sync(content: &str, dep_states: &HashMap<String, bool>)
     out
 }
 
-/// Format `content` against the on-disk note directory.
+/// Format `content` by running the default Lua hooks in sequence.
 ///
-/// 1. Reads referenced notes to build a `dep_states` snapshot (via `is_note_done`).
-/// 2. Updates `- [ ] @<id>` / `- [x] @<id>` checkboxes and propagates nested states.
-/// 3. Recomputes and applies the note's own `checklist-status` tag.
+/// Hook pipeline (both are embedded at compile time from `examples/hooks/`):
+/// 1. `checklist.lua` — local nested checkbox propagation + checklist-status update
+/// 2. `relation_status.lua` — override status to "done" for archived/legacy notes
 ///
-/// Boundary: reads (never writes) referenced notes. `is_note_done` on dependency
-/// content is a best-effort read of their current reconciled state (trusts metadata
-/// written by `reconcile`). This function does NOT perform global graph solving
-/// (SCC/DAG/fixed-point); that responsibility belongs exclusively to `reconcile`.
-pub async fn format_content(content: &str, note_dir: &Path) -> String {
-    // Collect all @IDs referenced on todo lines (skip fenced blocks)
-    let mut ids_to_fetch: Vec<String> = Vec::new();
-    let mut in_fence = false;
-    for line in content.lines() {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
-            continue;
-        }
-        if !is_todo_line(line) {
-            continue;
-        }
-        for cap in RE_TODO_ID.captures_iter(line) {
-            if let Some(m) = cap.get(1) {
-                let id = m.as_str().to_string();
-                if !ids_to_fetch.contains(&id) {
-                    ids_to_fetch.push(id);
-                }
+/// Cross-file ref-checkbox sync (`@ID` items) is intentionally NOT performed here;
+/// that is the exclusive responsibility of the `reconcile` command.
+///
+/// On any hook error the step is skipped and a warning is emitted; the original
+/// content (or the output of the previous step) is passed through unchanged.
+pub async fn format_content(content: &str, _note_dir: &Path) -> String {
+    run_default_hooks(content)
+}
+
+pub(crate) fn run_default_hooks(content: &str) -> String {
+    let hooks: &[(&str, &str)] = &[
+        ("checklist", DEFAULT_CHECKLIST_HOOK),
+        ("relation_status", DEFAULT_RELATION_HOOK),
+    ];
+
+    let mut current = content.to_string();
+    for (name, src) in hooks {
+        let runner = match HookRunner::load_str(src) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("hook '{name}' load error: {e}");
+                continue;
             }
+        };
+        let input = build_hook_note_input(&current);
+        let result = match runner.run(&input) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("hook '{name}' run error: {e}");
+                continue;
+            }
+        };
+        match apply_hook_result(&result, &current) {
+            Ok(out) => current = out,
+            Err(e) => tracing::warn!("hook '{name}' apply error: {e}"),
         }
     }
-
-    let mut dep_states: HashMap<String, bool> = HashMap::new();
-    for id in ids_to_fetch {
-        let path = note_dir.join(format!("{id}.typ"));
-        let done = match tokio::fs::read_to_string(&path).await {
-            Ok(c) => is_note_done(&c),
-            Err(_) => false,
-        };
-        dep_states.insert(id, done);
-    }
-
-    normalize_note(content, &dep_states)
+    current
 }
 
 /// Propagate nested checkbox states bottom-up: if a todo item has children,
