@@ -226,11 +226,13 @@ fn builtin_return_type(
             ensure_type(&args[0], &Type::NoteRef)?;
             ensure_type(&args[1], &Type::String)?;
             match &arg_exprs[1] {
-                Expr::Lit(Value::String(field)) => Ok(env
-                    .metadata_kinds
-                    .get(field.as_ref())
-                    .cloned()
-                    .unwrap_or(Type::String)),
+                Expr::Lit(Value::String(field)) => {
+                    let field = field.as_ref();
+                    env.metadata_kinds
+                        .get(field)
+                        .cloned()
+                        .ok_or_else(|| TypeError::UnknownMetadataField(field.to_string()))
+                }
                 _ => Ok(Type::Any),
             }
         }
@@ -417,7 +419,7 @@ fn bootstrap_call_type(name: &str, args: &[Expr], metadata_kinds: &HashMap<Strin
             Some(Expr::Lit(Value::String(field))) => metadata_kinds
                 .get(field.as_ref())
                 .cloned()
-                .unwrap_or(Type::String),
+                .unwrap_or(Type::Any),
             _ => Type::Any,
         },
         "map" => Type::List(Box::new(Type::Any)),
@@ -608,5 +610,16 @@ mod tests {
             },
         ];
         type_check_module_with_metadata(&module, &metadata_fields).expect("should typecheck");
+    }
+
+    #[test]
+    fn observe_meta_unknown_literal_field_fails() {
+        let src = r#"
+        (module
+          (define (test n) (observe_meta n "user.typo")))
+        "#;
+        let module = parse(src);
+        let err = type_check_module_with_metadata(&module, &[]).expect_err("should fail");
+        assert!(matches!(err, TypeError::UnknownMetadataField(field) if field == "user.typo"));
     }
 }

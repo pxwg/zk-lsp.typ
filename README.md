@@ -580,8 +580,8 @@ See `lua/zk_hook_types.lua` for the full EmmyLua type reference and `examples/ho
 2. Loads the built-in reconcile module
 3. Loads and merges any configured `[[reconcile.rule]]` files from disk
 4. Parses and type-checks the merged module against the builtin function surface
-5. Evaluates `materialized_fields`, `effective_checked`, and `effective_meta` across the workspace with unified call-stack cycle detection
-6. Collects reconcile diagnostics with precise file and span locations
+5. Evaluates `effective_checked` for every checkbox, then evaluates `materialized_fields` and `effective_meta` for every note, with unified call-stack cycle detection
+6. Collects reconcile diagnostics with file/span locations; cycle diagnostics also include related locations for the other edges in the same cycle
 7. If any reconcile diagnostic exists, aborts and reports all of them in Typst-style CLI output
 8. Otherwise writes back changed checkbox states and every metadata field declared by `materialized_fields`
 
@@ -647,8 +647,8 @@ You can use zettelkasten notes as task management tools by adding checklist entr
 1. `zk-lsp new` creates a note with `checklist-status = "none"` and no checklist entries
 2. The user adds `- [ ]` or `- [ ] @B` entries to the note body
   - If any `@ID` references are added, this checkbox would not be considered done until the referenced note's `checklist-status` is `done`
-3. `zk-lsp format` updates `checklist-status` to `active` and adds the `#tag.todo` tag
-4. When all checkboxes are ticked, `zk-lsp format` updates `checklist-status` to `done`, replaces `checklist-status = "active"` with `checklist-status = "done"` in the metadata
+3. `zk-lsp format` applies the configured hook pipeline to the current note
+4. `zk-lsp reconcile` computes cross-file checkbox truth and writes back checkbox states plus any metadata fields declared by `materialized_fields`
 5. When an idea is no longer useful, e.g.:
   - The note is superseded by a newer version: changing the metadata from `relation = "active"` to `relation = "legacy"`, and optionally adding some relation notes with `relation-target = ["<id1>",...]` to point to the newer insights
   - The note is manually archived by the user: changing the metadata to `checklist-status = "archived"` and optionally adding `relation-target = ["<id1>",...]` to point to the successor note(s)

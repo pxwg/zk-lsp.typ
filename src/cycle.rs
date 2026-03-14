@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 /// Cycle detection on the task dependency graph.
 ///
 /// `detect_cycles` runs Tarjan SCC; `render_cycle_errors` formats results for CLI output.

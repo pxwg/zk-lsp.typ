@@ -31,7 +31,27 @@ pub fn load_module(rule_paths: &[PathBuf], disable_default_rules: bool) -> Resul
         merged = merge_modules(merged, overlay);
     }
 
+    validate_required_rules(&merged)?;
+
     Ok(merged)
+}
+
+fn validate_required_rules(module: &Module) -> Result<()> {
+    const REQUIRED_RULES: &[&str] = &["materialized_fields", "effective_checked", "effective_meta"];
+    let missing: Vec<&str> = REQUIRED_RULES
+        .iter()
+        .copied()
+        .filter(|name| !module.rules.iter().any(|rule| rule.name == *name))
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "reconcile module missing required rule(s): {}",
+        missing.join(", ")
+    )
 }
 
 fn merge_modules(mut base: Module, overlay: Module) -> Module {
@@ -75,9 +95,10 @@ mod tests {
 
     #[test]
     fn default_module_can_be_disabled() {
-        let module = load_module(&[], true).expect("load");
-        assert!(module.rules.is_empty());
-        assert!(!module.policy_explicit);
+        let err = load_module(&[], true).expect_err("load should fail");
+        assert!(err
+            .to_string()
+            .contains("reconcile module missing required rule(s)"));
     }
 
     #[test]
@@ -184,6 +205,7 @@ mod tests {
             &path,
             r#"(module
                  (policy (cycle unknown))
+                 (define (materialized_fields n) (list))
                  (define (effective_checked c) (observe_checked c))
                  (define (effective_meta n field) (observe_meta n field)))"#,
         )
@@ -202,6 +224,31 @@ mod tests {
             loaded.policy.cycle,
             crate::reconcile::ast::CyclePolicy::Unknown
         ));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_required_rules_fail_load() {
+        let dir = std::env::temp_dir().join(format!(
+            "zk-lsp-rule-missing-required-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("custom.lisp");
+        std::fs::write(
+            &path,
+            r#"(module (define (effective_meta n field) (observe_meta n field)))"#,
+        )
+        .expect("write");
+
+        let err = load_module(&[path], true).expect_err("load should fail");
+        assert!(err
+            .to_string()
+            .contains("reconcile module missing required rule(s)"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

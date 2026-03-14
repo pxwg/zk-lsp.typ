@@ -22,8 +22,7 @@ use anyhow::Result;
 use unicode_width::UnicodeWidthStr;
 
 use crate::config::WikiConfig;
-use crate::cycle;
-use crate::dependency_graph;
+use crate::dependency_graph::{self, CycleEdgeOccurrence, DependencyGraph};
 use crate::handlers::formatting::apply_metadata_patch;
 
 use self::default_module::load_module;
@@ -33,6 +32,12 @@ use self::types::{
     DiagnosticKind, DiagnosticLocation, DiagnosticSeverity, NoteId, ReconcileDiagnostic, Value,
 };
 use self::writeback::normalize_note_from_checked;
+
+#[derive(Debug)]
+struct WorkspaceCycle {
+    nodes: Vec<NoteId>,
+    edges: Vec<CycleEdgeOccurrence>,
+}
 
 // ---------------------------------------------------------------------------
 // Public stats
@@ -197,22 +202,36 @@ fn build_diagnostics(
     eval_diagnostics: Vec<ReconcileDiagnostic>,
 ) -> Vec<ReconcileDiagnostic> {
     let graph = dependency_graph::build_dependency_graph(notes);
-    let cycles = cycle::detect_cycles(&graph);
-    let mut diagnostics = cycle_diagnostics(&cycles);
+    let mut diagnostics = cycle_diagnostics(&graph);
     diagnostics.extend(located_eval_diagnostics(eval_diagnostics, notes));
     diagnostics
 }
 
-fn cycle_diagnostics(cycles: &[cycle::DependencyCycle]) -> Vec<ReconcileDiagnostic> {
+fn cycle_diagnostics(graph: &DependencyGraph) -> Vec<ReconcileDiagnostic> {
+    let cycles = detect_workspace_cycles(graph);
     let mut diagnostics = Vec::new();
     for cycle in cycles {
+        let cycle_chain = render_cycle_chain(&cycle.nodes);
         for edge in &cycle.edges {
+            let related_locations = cycle
+                .edges
+                .iter()
+                .filter(|other| {
+                    !(other.file_path == edge.file_path
+                        && other.line == edge.line
+                        && other.byte_start == edge.byte_start
+                        && other.byte_end == edge.byte_end)
+                })
+                .map(|other| DiagnosticLocation {
+                    file_path: other.file_path.clone(),
+                    line: other.line,
+                    byte_start: other.byte_start,
+                    byte_end: other.byte_end,
+                })
+                .collect();
             diagnostics.push(ReconcileDiagnostic {
                 note_id: edge.from_note_id.clone(),
-                message: format!(
-                    "Cyclic task dependency: {} -> ... -> {}",
-                    edge.from_note_id, edge.from_note_id
-                ),
+                message: format!("Cyclic task dependency: {cycle_chain}"),
                 kind: DiagnosticKind::Cycle,
                 severity: DiagnosticSeverity::Error,
                 location: Some(DiagnosticLocation {
@@ -221,6 +240,7 @@ fn cycle_diagnostics(cycles: &[cycle::DependencyCycle]) -> Vec<ReconcileDiagnost
                     byte_start: edge.byte_start,
                     byte_end: edge.byte_end,
                 }),
+                related_locations,
             });
         }
     }
@@ -247,6 +267,106 @@ fn located_eval_diagnostics(
             diag
         })
         .collect()
+}
+
+fn detect_workspace_cycles(graph: &DependencyGraph) -> Vec<WorkspaceCycle> {
+    struct TarjanState<'a> {
+        graph: &'a HashMap<String, Vec<String>>,
+        index_counter: usize,
+        stack: Vec<String>,
+        on_stack: HashMap<String, bool>,
+        index: HashMap<String, usize>,
+        lowlink: HashMap<String, usize>,
+        sccs: Vec<Vec<String>>,
+    }
+
+    impl<'a> TarjanState<'a> {
+        fn strongconnect(&mut self, v: &str) {
+            self.index.insert(v.to_string(), self.index_counter);
+            self.lowlink.insert(v.to_string(), self.index_counter);
+            self.index_counter += 1;
+            self.stack.push(v.to_string());
+            self.on_stack.insert(v.to_string(), true);
+
+            if let Some(neighbors) = self.graph.get(v) {
+                let neighbors = neighbors.clone();
+                for w in neighbors {
+                    if !self.index.contains_key(&w) {
+                        self.strongconnect(&w);
+                        let lv = *self.lowlink.get(v).expect("lowlink exists");
+                        let lw = *self.lowlink.get(&w).unwrap_or(&usize::MAX);
+                        self.lowlink.insert(v.to_string(), lv.min(lw));
+                    } else if *self.on_stack.get(&w).unwrap_or(&false) {
+                        let lv = *self.lowlink.get(v).expect("lowlink exists");
+                        let iw = *self.index.get(&w).expect("index exists");
+                        self.lowlink.insert(v.to_string(), lv.min(iw));
+                    }
+                }
+            }
+
+            if self.lowlink.get(v) == self.index.get(v) {
+                let mut scc = Vec::new();
+                loop {
+                    let w = self.stack.pop().expect("stack pop");
+                    self.on_stack.insert(w.clone(), false);
+                    scc.push(w.clone());
+                    if w == v {
+                        break;
+                    }
+                }
+                self.sccs.push(scc);
+            }
+        }
+    }
+
+    let mut nodes = graph.nodes.clone();
+    nodes.sort();
+    let mut state = TarjanState {
+        graph: &graph.adj,
+        index_counter: 0,
+        stack: Vec::new(),
+        on_stack: HashMap::new(),
+        index: HashMap::new(),
+        lowlink: HashMap::new(),
+        sccs: Vec::new(),
+    };
+    for node in &nodes {
+        if !state.index.contains_key(node.as_str()) {
+            state.strongconnect(node);
+        }
+    }
+
+    state
+        .sccs
+        .into_iter()
+        .filter_map(|scc| {
+            let is_self_loop = scc.len() == 1
+                && graph
+                    .adj
+                    .get(&scc[0])
+                    .is_some_and(|neighbors| neighbors.contains(&scc[0]));
+            if scc.len() <= 1 && !is_self_loop {
+                return None;
+            }
+
+            let edges = graph
+                .occurrences
+                .iter()
+                .filter(|occ| scc.contains(&occ.from_note_id) && scc.contains(&occ.to_note_id))
+                .cloned()
+                .collect();
+            Some(WorkspaceCycle { nodes: scc, edges })
+        })
+        .collect()
+}
+
+fn render_cycle_chain(nodes: &[NoteId]) -> String {
+    let mut chain = nodes.to_vec();
+    chain.sort();
+    if let Some(first) = chain.first().cloned() {
+        chain.push(first);
+    }
+    chain.join(" -> ")
 }
 
 fn render_diagnostics(
@@ -665,13 +785,16 @@ mod tests {
         ]);
 
         let graph = dependency_graph::build_dependency_graph(&notes);
-        let diagnostics = cycle_diagnostics(&cycle::detect_cycles(&graph));
+        let diagnostics = cycle_diagnostics(&graph);
 
         assert!(!diagnostics.is_empty());
         assert!(diagnostics.iter().all(|diag| diag.location.is_some()));
         assert!(diagnostics
             .iter()
             .all(|diag| diag.severity == DiagnosticSeverity::Error));
+        assert!(diagnostics
+            .iter()
+            .all(|diag| !diag.related_locations.is_empty()));
     }
 
     #[tokio::test]

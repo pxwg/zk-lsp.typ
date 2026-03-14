@@ -65,12 +65,12 @@ impl WorkspaceSnapshot {
             .unwrap_or_else(|| Value::String(Rc::<str>::from("")))
     }
 
-    #[allow(dead_code)]
-    pub fn observe_meta_status(&self, note_id: &NoteId) -> Status {
-        match self.observe_meta(note_id, "checklist-status") {
-            Value::Status(s) => s,
-            _ => Status::None,
-        }
+    pub fn has_metadata_field(&self, note_id: &NoteId, field: &str) -> bool {
+        self.notes
+            .get(note_id)
+            .map(|obs| obs.raw_meta.contains_key(field))
+            .unwrap_or(false)
+            || self.metadata_defaults.contains_key(field)
     }
 
     pub fn targets(&self, id: &CheckboxId) -> &[NoteId] {
@@ -555,8 +555,8 @@ mod tests {
     fn meta_status_fallback() {
         let content = make_toml_note("A", "1111111111", "done", "");
         let snap = single_note_snapshot("1111111111", &content);
-        let status = snap.observe_meta_status(&"1111111111".to_string());
-        assert_eq!(status, Status::Done);
+        let status = snap.observe_meta(&"1111111111".to_string(), "checklist-status");
+        assert_eq!(status, Value::Status(Status::Done));
     }
 
     #[test]

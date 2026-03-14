@@ -473,6 +473,50 @@ pub fn get_reconcile_diagnostics(
             }),
             source: Some("zk-lsp".into()),
             message: diag.message.clone(),
+            related_information: if diag.related_locations.is_empty() {
+                None
+            } else {
+                Some(
+                    diag.related_locations
+                        .iter()
+                        .map(|related| {
+                            let related_line = if related.file_path == file_path {
+                                content.lines().nth(related.line).unwrap_or("").to_string()
+                            } else {
+                                std::fs::read_to_string(&related.file_path)
+                                    .ok()
+                                    .and_then(|content| {
+                                        content.lines().nth(related.line).map(str::to_string)
+                                    })
+                                    .unwrap_or_default()
+                            };
+                            DiagnosticRelatedInformation {
+                                location: Location {
+                                    uri: Url::from_file_path(&related.file_path)
+                                        .expect("valid file path"),
+                                    range: Range {
+                                        start: Position {
+                                            line: related.line as u32,
+                                            character: parser::byte_to_utf16(
+                                                &related_line,
+                                                related.byte_start as usize,
+                                            ),
+                                        },
+                                        end: Position {
+                                            line: related.line as u32,
+                                            character: parser::byte_to_utf16(
+                                                &related_line,
+                                                related.byte_end as usize,
+                                            ),
+                                        },
+                                    },
+                                },
+                                message: "other dependency edge in the same cycle".to_string(),
+                            }
+                        })
+                        .collect(),
+                )
+            },
             ..Default::default()
         });
     }

@@ -281,6 +281,16 @@ impl<'a> Evaluator<'a> {
             },
             "observe_meta" => match args {
                 [Value::NoteRef(id), Value::String(field)] => {
+                    if !self.snapshot.has_metadata_field(id, field.as_ref()) {
+                        self.diagnostics.push(ReconcileDiagnostic {
+                            note_id: id.clone(),
+                            message: format!("unknown metadata field '{field}'"),
+                            kind: DiagnosticKind::UnknownMetadataField,
+                            severity: DiagnosticSeverity::Error,
+                            location: None,
+                            related_locations: Vec::new(),
+                        });
+                    }
                     Ok(self.snapshot.observe_meta(id, field.as_ref()))
                 }
                 _ => Err(EvalError::TypeMismatch {
@@ -341,6 +351,7 @@ impl<'a> Evaluator<'a> {
                 kind: DiagnosticKind::Cycle,
                 severity: DiagnosticSeverity::Error,
                 location: None,
+                related_locations: Vec::new(),
             });
         }
 
@@ -460,6 +471,7 @@ pub fn eval_all_typed(
                 kind: DiagnosticKind::EvalFallback,
                 severity: DiagnosticSeverity::Error,
                 location: None,
+                related_locations: Vec::new(),
             });
             continue;
         };
@@ -471,6 +483,7 @@ pub fn eval_all_typed(
                     kind: DiagnosticKind::EvalFallback,
                     severity: DiagnosticSeverity::Error,
                     location: None,
+                    related_locations: Vec::new(),
                 });
                 continue;
             };
@@ -591,7 +604,7 @@ mod tests {
         WorkspaceSnapshot::from_note_map(&map)
     }
 
-    fn effective_status(result: &EvalResult, note_id: &str) -> Option<Status> {
+    fn checklist_status_field(result: &EvalResult, note_id: &str) -> Option<Status> {
         result
             .effective_meta
             .get(&(note_id.to_string(), "checklist-status".to_string()))
@@ -607,7 +620,10 @@ mod tests {
         let snap = snapshot_from(&[("1111111111", &content)]);
         let module = default_module();
         let result = eval_all(&module, &snap);
-        assert_eq!(effective_status(&result, "1111111111"), Some(Status::Done));
+        assert_eq!(
+            checklist_status_field(&result, "1111111111"),
+            Some(Status::Done)
+        );
     }
 
     #[test]
@@ -616,7 +632,10 @@ mod tests {
         let snap = snapshot_from(&[("1111111111", &content)]);
         let module = default_module();
         let result = eval_all(&module, &snap);
-        assert_eq!(effective_status(&result, "1111111111"), Some(Status::Wip));
+        assert_eq!(
+            checklist_status_field(&result, "1111111111"),
+            Some(Status::Wip)
+        );
     }
 
     #[test]
@@ -626,7 +645,10 @@ mod tests {
         let snap = snapshot_from(&[("1111111111", &note_a), ("2222222222", &note_b)]);
         let module = default_module();
         let result = eval_all(&module, &snap);
-        assert_eq!(effective_status(&result, "1111111111"), Some(Status::Done));
+        assert_eq!(
+            checklist_status_field(&result, "1111111111"),
+            Some(Status::Done)
+        );
     }
 
     #[test]
@@ -640,7 +662,10 @@ mod tests {
         let snap = snapshot_from(&[("1111111111", &content)]);
         let module = default_module();
         let result = eval_all(&module, &snap);
-        assert_eq!(effective_status(&result, "1111111111"), Some(Status::Wip));
+        assert_eq!(
+            checklist_status_field(&result, "1111111111"),
+            Some(Status::Wip)
+        );
     }
 
     #[test]
@@ -662,7 +687,10 @@ mod tests {
         let snap = snapshot_from(&[("1111111111", &content)]);
         let module = default_module();
         let result = eval_all(&module, &snap);
-        assert_eq!(effective_status(&result, "1111111111"), Some(Status::Done));
+        assert_eq!(
+            checklist_status_field(&result, "1111111111"),
+            Some(Status::Done)
+        );
     }
 
     #[test]
