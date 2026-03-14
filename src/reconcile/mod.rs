@@ -21,7 +21,7 @@ use anyhow::Result;
 use crate::config::WikiConfig;
 use crate::handlers::formatting::{apply_metadata_patch, normalize_note_from_checked};
 
-use self::default_module::DEFAULT_MODULE;
+use self::default_module::load_module;
 use self::eval::eval_all;
 use self::materialize::materialize;
 use self::observe::WorkspaceSnapshot;
@@ -48,11 +48,13 @@ pub async fn run_reconcile(config: &WikiConfig, dry_run: bool) -> Result<Reconci
     let snapshot =
         WorkspaceSnapshot::from_note_map_with_metadata(&notes, &config.zk_config.metadata.fields);
 
-    // 3. Parse + type-check DEFAULT_MODULE (panics on failure — compile-time invariant)
-    let module = parser::parse_module(DEFAULT_MODULE)
-        .expect("DEFAULT_MODULE must always parse successfully");
+    // 3. Load, parse, and type-check the reconcile module.
+    let module = load_module(
+        &config.zk_config.reconcile_rules,
+        config.zk_config.disable_default_reconcile_rules,
+    )?;
     typecheck::type_check_module_with_metadata(&module, &config.zk_config.metadata.fields)
-        .expect("DEFAULT_MODULE must always typecheck successfully");
+        .map_err(anyhow::Error::msg)?;
 
     // 4. Evaluate
     let eval_result = eval_all(&module, &snapshot);
@@ -159,6 +161,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::reconcile::default_module::DEFAULT_MODULE;
     use crate::reconcile::eval::eval_all;
     use crate::reconcile::observe::WorkspaceSnapshot;
     use crate::reconcile::parser::parse_module;

@@ -178,6 +178,34 @@ fn parse_hooks_config(table: &toml::Table) -> Vec<PathBuf> {
     hooks
 }
 
+fn parse_reconcile_rules_config(table: &toml::Table) -> Vec<PathBuf> {
+    let rules_arr = match table
+        .get("reconcile")
+        .and_then(|v| v.get("rule"))
+        .and_then(|v| v.as_array())
+    {
+        Some(a) => a.clone(),
+        None => return Vec::new(),
+    };
+
+    let mut rules = Vec::new();
+    for entry in &rules_arr {
+        let t = match entry.as_table() {
+            Some(t) => t,
+            None => continue,
+        };
+        let path_str = match t.get("path").and_then(|v| v.as_str()) {
+            Some(p) => p,
+            None => {
+                eprintln!("zk-lsp config: reconcile.rule entry missing 'path'");
+                continue;
+            }
+        };
+        rules.push(expand_tilde(path_str));
+    }
+    rules
+}
+
 /// Merged zk-lsp configuration.
 ///
 /// Load order (later overrides earlier):
@@ -191,8 +219,12 @@ pub struct ZkLspConfig {
     pub metadata: MetadataConfig,
     /// Lua hook scripts to run during formatting, in order (after default hooks).
     pub hooks: Vec<PathBuf>,
+    /// Reconcile DSL modules loaded at runtime and merged in order.
+    pub reconcile_rules: Vec<PathBuf>,
     /// If true, skip the built-in default hooks (checklist.lua + relation_status.lua).
     pub disable_default_hooks: bool,
+    /// If true, do not preload the built-in reconcile DSL module.
+    pub disable_default_reconcile_rules: bool,
 }
 
 impl ZkLspConfig {
@@ -222,8 +254,13 @@ impl ZkLspConfig {
                 .map(String::from),
             metadata: parse_metadata_config(&table),
             hooks: parse_hooks_config(&table),
+            reconcile_rules: parse_reconcile_rules_config(&table),
             disable_default_hooks: table
                 .get("disable_default_hooks")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            disable_default_reconcile_rules: table
+                .get("disable_default_reconcile_rules")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
         }
@@ -238,11 +275,16 @@ impl ZkLspConfig {
         let project = Self::from_path(&wiki_root.join("zk-lsp.toml"));
         let mut hooks = user.hooks;
         hooks.extend(project.hooks);
+        let mut reconcile_rules = user.reconcile_rules;
+        reconcile_rules.extend(project.reconcile_rules);
         Self {
             new_note_template: project.new_note_template.or(user.new_note_template),
             metadata: merge_metadata(user.metadata, project.metadata),
             hooks,
+            reconcile_rules,
             disable_default_hooks: user.disable_default_hooks || project.disable_default_hooks,
+            disable_default_reconcile_rules: user.disable_default_reconcile_rules
+                || project.disable_default_reconcile_rules,
         }
     }
 }
@@ -294,8 +336,13 @@ mod tests {
             new_note_template: None,
             metadata: parse_metadata_config(&table),
             hooks: parse_hooks_config(&table),
+            reconcile_rules: parse_reconcile_rules_config(&table),
             disable_default_hooks: table
                 .get("disable_default_hooks")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            disable_default_reconcile_rules: table
+                .get("disable_default_reconcile_rules")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
         }
@@ -456,6 +503,45 @@ default = ""
     }
 
     #[test]
+    fn test_disable_default_reconcile_rules_false_by_default() {
+        let cfg = parse_config("");
+        assert!(!cfg.disable_default_reconcile_rules);
+    }
+
+    #[test]
+    fn test_disable_default_reconcile_rules_can_be_set() {
+        let cfg = parse_config("disable_default_reconcile_rules = true\n");
+        assert!(cfg.disable_default_reconcile_rules);
+    }
+
+    #[test]
+    fn test_disable_default_reconcile_rules_merge_either_wins() {
+        let user = ZkLspConfig {
+            disable_default_reconcile_rules: true,
+            ..Default::default()
+        };
+        let project = ZkLspConfig {
+            disable_default_reconcile_rules: false,
+            ..Default::default()
+        };
+        assert!(
+            user.disable_default_reconcile_rules || project.disable_default_reconcile_rules
+        );
+
+        let user2 = ZkLspConfig {
+            disable_default_reconcile_rules: false,
+            ..Default::default()
+        };
+        let project2 = ZkLspConfig {
+            disable_default_reconcile_rules: true,
+            ..Default::default()
+        };
+        assert!(
+            user2.disable_default_reconcile_rules || project2.disable_default_reconcile_rules
+        );
+    }
+
+    #[test]
     fn test_hook_config_parsing() {
         let cfg = parse_config(
             r#"
@@ -519,6 +605,56 @@ kind = "lua"
         assert_eq!(merged_hooks.len(), 2);
         assert_eq!(merged_hooks[0], PathBuf::from("/user/checklist.lua"));
         assert_eq!(merged_hooks[1], PathBuf::from("/project/extra.lua"));
+    }
+
+    #[test]
+    fn test_reconcile_rule_config_parsing() {
+        let cfg = parse_config(
+            r#"
+[[reconcile.rule]]
+path = "/absolute/path/checklist.lisp"
+
+[[reconcile.rule]]
+path = "/absolute/path/custom.lisp"
+"#,
+        );
+        assert_eq!(cfg.reconcile_rules.len(), 2);
+        assert_eq!(
+            cfg.reconcile_rules[0],
+            PathBuf::from("/absolute/path/checklist.lisp")
+        );
+        assert_eq!(
+            cfg.reconcile_rules[1],
+            PathBuf::from("/absolute/path/custom.lisp")
+        );
+    }
+
+    #[test]
+    fn test_reconcile_rule_missing_path_skipped() {
+        let cfg = parse_config(
+            r#"
+[[reconcile.rule]]
+name = "missing"
+"#,
+        );
+        assert!(cfg.reconcile_rules.is_empty());
+    }
+
+    #[test]
+    fn test_reconcile_rule_merge_appends() {
+        let user = ZkLspConfig {
+            reconcile_rules: vec![PathBuf::from("/user/checklist.lisp")],
+            ..Default::default()
+        };
+        let project = ZkLspConfig {
+            reconcile_rules: vec![PathBuf::from("/project/custom.lisp")],
+            ..Default::default()
+        };
+        let mut merged_rules = user.reconcile_rules;
+        merged_rules.extend(project.reconcile_rules);
+        assert_eq!(merged_rules.len(), 2);
+        assert_eq!(merged_rules[0], PathBuf::from("/user/checklist.lisp"));
+        assert_eq!(merged_rules[1], PathBuf::from("/project/custom.lisp"));
     }
 
     #[test]

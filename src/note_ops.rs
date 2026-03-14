@@ -128,7 +128,9 @@ mod tests {
             new_note_template: None,
             metadata: MetadataConfig { fields },
             hooks: Vec::new(),
+            reconcile_rules: Vec::new(),
             disable_default_hooks: false,
+            disable_default_reconcile_rules: false,
         }
     }
 

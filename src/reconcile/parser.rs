@@ -168,6 +168,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
     p.expect_symbol("module")?;
 
     let mut policy = Policy::default();
+    let mut policy_explicit = false;
     let mut rules: Vec<Rule> = Vec::new();
 
     // Parse zero or more forms until ')'
@@ -186,6 +187,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
                 match head {
                     Some(Token::Symbol(s)) if s == "policy" => {
                         policy = parse_policy(&mut p)?;
+                        policy_explicit = true;
                     }
                     Some(Token::Symbol(s)) if s == "define" => {
                         let rule = parse_define(&mut p)?;
@@ -217,7 +219,11 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
         }
     }
 
-    Ok(Module { policy, rules })
+    Ok(Module {
+        policy,
+        policy_explicit,
+        rules,
+    })
 }
 
 fn parse_policy(p: &mut Parser) -> Result<Policy, ParseError> {

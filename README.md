@@ -247,6 +247,41 @@ tags = []
 
 Custom fields are preserved by the parser and included in `note-info` JSON output. Core fields (`schema-version`, `aliases`, `abstract`, `keywords`, `generated`, `checklist-status`, `relation`, `relation-target`) cannot be overridden.
 
+### Reconcile rule modules
+
+`zk-lsp reconcile` uses a built-in default DSL module from `examples/rules/checklist.lisp`. You can extend or override it with runtime-loaded Lisp rule files configured in the same config files as hooks.
+
+```toml
+# <wiki-root>/zk-lsp.toml
+# Disable the built-in default reconcile module entirely
+disable_default_reconcile_rules = false
+
+[[reconcile.rule]]
+path = "~/.config/zk-lsp/reconcile/base.lisp"
+
+[[reconcile.rule]]
+path = "./reconcile/project_rules.lisp"
+```
+
+Rules are loaded fresh from disk on every `zk-lsp reconcile` run, so editing a `.lisp` file does not require recompiling `zk-lsp`; the next run picks up the new contents immediately.
+
+Merge order is:
+
+1. Built-in default module
+2. User-level `[[reconcile.rule]]` files, in config order
+3. Project-level `[[reconcile.rule]]` files, in config order
+
+If `disable_default_reconcile_rules = true`, step 1 is skipped and only your configured files are loaded. In that mode you must provide at least `effective_checked` and `effective_meta` yourself.
+
+Merge semantics:
+
+- Each file must contain a full `(module ...)` form
+- New helper rules are appended
+- If a later file defines a rule with the same name, it replaces the earlier definition
+- `policy` is overridden only when the later file explicitly declares `(policy ...)`
+
+This makes it practical to keep a small shared base module in your user config and layer wiki-specific overrides on top.
+
 ## Note Info JSON
 
 `zk-lsp note-info <id>` outputs a single note's metadata as stable JSON, suitable for consumption by external tools and scripts.
@@ -434,12 +469,25 @@ See `lua/zk_hook_types.lua` for the full EmmyLua type reference and `examples/ho
 
 ## Reconcile
 
-`zk-lsp reconcile` evaluates done-states for the entire wiki in dependency order and rewrites changed files:
+`zk-lsp reconcile` is driven by the Reconcile DSL, not a hard-coded checklist algorithm. On each run it:
 
-1. Builds a dependency graph from all `- [ ] @<id>` checklist entries
-2. Fails fast if any cyclic dependencies are detected (prints Typst-style errors with file locations)
-3. Evaluates note done-states in a single Kahn topological pass
-4. Writes back only changed notes (updates `checklist-status` in TOML metadata)
+1. Scans the wiki and builds a workspace snapshot of notes, checkboxes, and typed metadata
+2. Loads the built-in reconcile module
+3. Loads and merges any configured `[[reconcile.rule]]` files from disk
+4. Parses and type-checks the merged module
+5. Evaluates `effective_checked` and `effective_meta` across the workspace
+6. Writes back changed checkbox states and the materialized `checklist-status`
+
+The default module reproduces the built-in checklist behavior:
+
+- Local checkbox leaves aggregate to `todo` / `wip` / `done`
+- Ref checkboxes derive from their target notes
+- Multi-target refs require `all_done`
+- Archived notes are forced to `done`
+
+If you provide custom rule modules, they replace or extend that default behavior according to the merge rules above.
+
+If `disable_default_reconcile_rules = true`, `zk-lsp reconcile` evaluates only your configured DSL modules and does not preload `examples/rules/checklist.lisp`.
 
 Use `--dry-run` to preview changes without writing files.
 

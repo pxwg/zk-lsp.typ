@@ -36,6 +36,7 @@ pub struct Rule {
 #[derive(Debug, Clone)]
 pub struct Module {
     pub policy: Policy,
+    pub policy_explicit: bool,
     pub rules: Vec<Rule>,
 }
 
