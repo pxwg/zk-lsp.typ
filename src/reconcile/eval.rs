@@ -13,6 +13,7 @@ use super::types::{
 // ---------------------------------------------------------------------------
 
 pub struct EvalResult {
+    #[allow(dead_code)]
     pub effective_status: HashMap<NoteId, Status>,
     pub effective_meta: HashMap<(NoteId, String), Value>,
     pub effective_checked: HashMap<CheckboxId, bool>,
@@ -49,7 +50,6 @@ impl<'a> Evaluator<'a> {
     // ---------------------------------------------------------------------------
 
     /// Generic per-note field evaluator with memoization and cycle detection.
-    /// For field="checklist-status", looks up the "effective_status" rule.
     fn eval_effective_meta(&mut self, note_id: &NoteId, field: &str) -> Value {
         let cache_key = (note_id.clone(), field.to_string());
 
@@ -65,47 +65,45 @@ impl<'a> Evaluator<'a> {
                     kind: DiagnosticKind::Cycle,
                 });
             }
-            return Value::Status(self.module.policy.unknown_status.clone());
+            return self.unknown_meta_value(field);
         }
 
         self.visiting_meta.insert(cache_key.clone());
-
-        // "checklist-status" maps to the "effective_status" rule.
-        let rule_name = match field {
-            "checklist-status" => "effective_status",
-            other => other,
-        };
 
         let value = if let Some(rule) = self
             .module
             .rules
             .iter()
-            .find(|r| r.name == rule_name)
+            .find(|r| r.name == "effective_meta")
             .cloned()
         {
-            let arg = Value::NoteRef(note_id.clone());
-            match self.eval_rule(&rule.params, &rule.body, &[arg]) {
+            let args = [
+                Value::NoteRef(note_id.clone()),
+                Value::String(field.to_string()),
+            ];
+            match self.eval_rule(&rule.params, &rule.body, &args) {
                 Ok(Value::Status(s)) if field == "checklist-status" => Value::Status(s),
                 Ok(_) if field == "checklist-status" => {
                     self.diagnostics.push(ReconcileDiagnostic {
                         note_id: note_id.clone(),
-                        message: "effective_status rule returned non-Status value".to_string(),
+                        message: "effective_meta returned non-Status for checklist-status"
+                            .to_string(),
                         kind: DiagnosticKind::EvalFallback,
                     });
-                    Value::Status(self.module.policy.unknown_status.clone())
+                    self.unknown_meta_value(field)
                 }
                 Ok(v) => v,
                 Err(e) => {
                     self.diagnostics.push(ReconcileDiagnostic {
                         note_id: note_id.clone(),
-                        message: format!("eval error in {rule_name}: {e}"),
+                        message: format!("eval error in effective_meta: {e}"),
                         kind: DiagnosticKind::EvalFallback,
                     });
-                    Value::Status(self.module.policy.unknown_status.clone())
+                    self.unknown_meta_value(field)
                 }
             }
         } else {
-            Value::Status(self.module.policy.unknown_status.clone())
+            self.unknown_meta_value(field)
         };
 
         self.visiting_meta.remove(&cache_key);
@@ -117,6 +115,14 @@ impl<'a> Evaluator<'a> {
         match self.eval_effective_meta(note_id, "checklist-status") {
             Value::Status(s) => s,
             _ => self.module.policy.unknown_status.clone(),
+        }
+    }
+
+    fn unknown_meta_value(&self, field: &str) -> Value {
+        if field == "checklist-status" {
+            Value::Status(self.module.policy.unknown_status.clone())
+        } else {
+            Value::String(String::new())
         }
     }
 
@@ -211,12 +217,14 @@ impl<'a> Evaluator<'a> {
         arg_exprs: &[Expr],
         env: &HashMap<String, Value>,
     ) -> Result<Value, EvalError> {
-        // Route effective_status calls through the memoized/cycle-detected path.
-        // This is needed because (map effective_status ...) in the DSL would otherwise
-        // bypass the visiting_meta check and cause infinite recursion on cycles.
-        if name == "effective_status" && arg_exprs.len() == 1 {
+        // Route effective_meta calls through the memoized/cycle-detected path.
+        // This is needed because DSL helper rules may call (effective_meta n field)
+        // directly, which would otherwise bypass the visiting_meta check.
+        if name == "effective_meta" && arg_exprs.len() == 2 {
             if let Ok(Value::NoteRef(id)) = self.eval_expr(&arg_exprs[0], env) {
-                return Ok(Value::Status(self.eval_effective_status(&id)));
+                if let Ok(Value::String(field)) = self.eval_expr(&arg_exprs[1], env) {
+                    return Ok(self.eval_effective_meta(&id, &field));
+                }
             }
         }
 
@@ -755,11 +763,15 @@ mod tests {
           (define (effective_checked c)
             (if (empty? (targets c))
                 (observe_checked c)
-                (all_done (map effective_status (targets c)))))
-          (define (effective_status n)
-            (if (empty? (local_checkboxes n))
-                (observe_meta n "checklist-status")
-                (aggregate_status (map effective_checked (local_checkboxes n))))))
+                (all_done (map target_status (targets c)))))
+          (define (target_status n)
+            (effective_meta n "checklist-status"))
+          (define (effective_meta n field)
+            (if (eq? field "checklist-status")
+                (if (empty? (local_checkboxes n))
+                    (observe_meta n "checklist-status")
+                    (aggregate_status (map effective_checked (local_checkboxes n))))
+                (observe_meta n field))))
         "#;
         let module = parse_module(src).expect("parse");
         let a = make_toml_note("A", "1111111111", "none", "- [ ] @2222222222\n");

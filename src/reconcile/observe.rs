@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::config::{MetadataFieldConfig, MetadataFieldKind};
 use crate::parser::{self, ChecklistItemKind, ChecklistStatus, Relation};
 
 use super::types::{CheckboxId, NoteId, Status, Value};
@@ -23,8 +24,8 @@ pub struct NoteObs {
     #[allow(dead_code)]
     pub relation: Relation,
     pub checklist_status: ChecklistStatus,
-    /// Raw string values for generic `observe_meta` queries (e.g. "relation", "checklist-status").
-    pub raw_meta: HashMap<String, String>,
+    /// Typed metadata values for generic `observe_meta` queries.
+    pub raw_meta: HashMap<String, Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -38,6 +39,8 @@ pub struct WorkspaceSnapshot {
     pub checkboxes: HashMap<CheckboxId, CheckboxObs>,
     /// Note id → leaf checkbox IDs (for effective_status eval)
     pub note_leaf_checkboxes: HashMap<NoteId, Vec<CheckboxId>>,
+    /// Config-driven default values for known metadata fields.
+    pub metadata_defaults: HashMap<String, Value>,
 }
 
 impl WorkspaceSnapshot {
@@ -46,7 +49,7 @@ impl WorkspaceSnapshot {
     }
 
     /// Generic metadata observation. Returns `Value::Status` for "checklist-status",
-    /// `Value::String` for all other fields, and an empty string for unknown notes/fields.
+    /// typed values for configured metadata fields, and an empty string for unknown fields.
     pub fn observe_meta(&self, note_id: &NoteId, field: &str) -> Value {
         let obs = match self.notes.get(note_id) {
             Some(o) => o,
@@ -54,7 +57,10 @@ impl WorkspaceSnapshot {
                 return if field == "checklist-status" {
                     Value::Status(Status::None)
                 } else {
-                    Value::String(String::new())
+                    self.metadata_defaults
+                        .get(field)
+                        .cloned()
+                        .unwrap_or_else(|| Value::String(String::new()))
                 };
             }
         };
@@ -68,10 +74,12 @@ impl WorkspaceSnapshot {
                 };
                 Value::Status(s)
             }
-            _ => {
-                let s = obs.raw_meta.get(field).cloned().unwrap_or_default();
-                Value::String(s)
-            }
+            _ => obs
+                .raw_meta
+                .get(field)
+                .cloned()
+                .or_else(|| self.metadata_defaults.get(field).cloned())
+                .unwrap_or_else(|| Value::String(String::new())),
         }
     }
 
@@ -114,9 +122,18 @@ impl WorkspaceSnapshot {
     /// Build a snapshot from a map of `note_id → (path, content)`.
     /// Used in tests and in production (after async scan).
     pub fn from_note_map(notes: &HashMap<NoteId, (PathBuf, String)>) -> Self {
+        Self::from_note_map_with_metadata(notes, &[])
+    }
+
+    pub fn from_note_map_with_metadata(
+        notes: &HashMap<NoteId, (PathBuf, String)>,
+        metadata_fields: &[MetadataFieldConfig],
+    ) -> Self {
         let mut note_obs_map: HashMap<NoteId, NoteObs> = HashMap::new();
         let mut checkboxes: HashMap<CheckboxId, CheckboxObs> = HashMap::new();
         let mut note_leaf_checkboxes: HashMap<NoteId, Vec<CheckboxId>> = HashMap::new();
+        let metadata_kinds = metadata_kind_map(metadata_fields);
+        let metadata_defaults = metadata_default_map(metadata_fields);
 
         for (id, (_path, content)) in notes {
             // Parse header for relation + checklist_status
@@ -136,20 +153,7 @@ impl WorkspaceSnapshot {
                 (Relation::Active, ChecklistStatus::None)
             };
 
-            let relation_str = match relation {
-                Relation::Active => "active",
-                Relation::Archived => "archived",
-                Relation::Legacy => "legacy",
-            };
-            let status_str = match checklist_status {
-                ChecklistStatus::Done => "done",
-                ChecklistStatus::Wip => "wip",
-                ChecklistStatus::Todo => "todo",
-                ChecklistStatus::None => "none",
-            };
-            let mut raw_meta = HashMap::new();
-            raw_meta.insert("relation".to_string(), relation_str.to_string());
-            raw_meta.insert("checklist-status".to_string(), status_str.to_string());
+            let raw_meta = extract_raw_meta(content, &metadata_kinds);
 
             note_obs_map.insert(
                 id.clone(),
@@ -200,7 +204,123 @@ impl WorkspaceSnapshot {
             notes: note_obs_map,
             checkboxes,
             note_leaf_checkboxes,
+            metadata_defaults,
         }
+    }
+}
+
+fn metadata_kind_map(
+    metadata_fields: &[MetadataFieldConfig],
+) -> HashMap<String, MetadataFieldKind> {
+    metadata_fields
+        .iter()
+        .map(|field| (field.path.clone(), field.kind.clone()))
+        .collect()
+}
+
+fn metadata_default_map(metadata_fields: &[MetadataFieldConfig]) -> HashMap<String, Value> {
+    metadata_fields
+        .iter()
+        .map(|field| {
+            (
+                field.path.clone(),
+                toml_value_to_typed_value(&field.default, Some(&field.kind)),
+            )
+        })
+        .collect()
+}
+
+fn extract_raw_meta(
+    content: &str,
+    metadata_kinds: &HashMap<String, MetadataFieldKind>,
+) -> HashMap<String, Value> {
+    let mut raw_meta = HashMap::new();
+
+    let Some(block) = parser::find_toml_metadata_block(content) else {
+        return raw_meta;
+    };
+    let Ok(value) = block.toml_content.parse::<toml::Value>() else {
+        return raw_meta;
+    };
+    let Some(table) = value.as_table() else {
+        return raw_meta;
+    };
+
+    flatten_toml_table("", table, metadata_kinds, &mut raw_meta);
+    raw_meta
+}
+
+fn flatten_toml_table(
+    prefix: &str,
+    table: &toml::Table,
+    metadata_kinds: &HashMap<String, MetadataFieldKind>,
+    raw_meta: &mut HashMap<String, Value>,
+) {
+    for (key, value) in table {
+        let full_key = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+
+        match value {
+            toml::Value::Table(inner) => {
+                flatten_toml_table(&full_key, inner, metadata_kinds, raw_meta)
+            }
+            _ => {
+                raw_meta.insert(
+                    full_key.clone(),
+                    toml_value_to_typed_value(value, metadata_kinds.get(&full_key)),
+                );
+            }
+        }
+    }
+}
+
+fn toml_value_to_typed_value(value: &toml::Value, kind: Option<&MetadataFieldKind>) -> Value {
+    match kind {
+        Some(MetadataFieldKind::Boolean) => Value::Bool(value.as_bool().unwrap_or(false)),
+        Some(MetadataFieldKind::ArrayString) => Value::List(
+            value
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(|s| Value::String(s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        Some(MetadataFieldKind::String) => Value::String(toml_value_to_string(value)),
+        None => Value::String(toml_value_to_string(value)),
+    }
+}
+
+fn toml_value_to_string(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(s) => s.clone(),
+        toml::Value::Integer(n) => n.to_string(),
+        toml::Value::Float(f) => f.to_string(),
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Datetime(dt) => dt.to_string(),
+        toml::Value::Array(items) => {
+            let rendered: Vec<String> = items.iter().map(toml_value_to_inline_string).collect();
+            format!("[{}]", rendered.join(", "))
+        }
+        toml::Value::Table(table) => {
+            let mut parts = Vec::new();
+            for (key, item) in table {
+                parts.push(format!("{key} = {}", toml_value_to_inline_string(item)));
+            }
+            format!("{{{}}}", parts.join(", "))
+        }
+    }
+}
+
+fn toml_value_to_inline_string(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(s) => format!("{s:?}"),
+        _ => toml_value_to_string(value),
     }
 }
 
@@ -238,6 +358,7 @@ pub async fn build_workspace_snapshot(note_dir: &Path) -> anyhow::Result<Workspa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{MetadataFieldConfig, MetadataFieldKind};
 
     fn make_toml_note(title: &str, id: &str, status: &str, body: &str) -> String {
         format!(
@@ -285,6 +406,32 @@ mod tests {
         )
     }
 
+    fn make_toml_note_with_extra_metadata(
+        title: &str,
+        id: &str,
+        status: &str,
+        extra_metadata: &str,
+        body: &str,
+    ) -> String {
+        format!(
+            "#import \"../include.typ\": *\n\
+             #let zk-metadata = toml(bytes(\n\
+             \x20 ```toml\n\
+             \x20 schema-version = 1\n\
+             \x20 title = \"{title}\"\n\
+             \x20 tags = []\n\
+             \x20 checklist-status = \"{status}\"\n\
+             \x20 generated = false\n\
+             {extra_metadata}\
+             \x20 ```.text,\n\
+             ))\n\
+             #show: zettel.with(metadata: zk-metadata)\n\
+             \n\
+             = {title} <{id}>\n\
+             {body}"
+        )
+    }
+
     fn single_note_snapshot(id: &str, content: &str) -> WorkspaceSnapshot {
         let mut map = HashMap::new();
         map.insert(
@@ -292,6 +439,19 @@ mod tests {
             (PathBuf::from(format!("{id}.typ")), content.to_string()),
         );
         WorkspaceSnapshot::from_note_map(&map)
+    }
+
+    fn single_note_snapshot_with_metadata(
+        id: &str,
+        content: &str,
+        metadata_fields: &[MetadataFieldConfig],
+    ) -> WorkspaceSnapshot {
+        let mut map = HashMap::new();
+        map.insert(
+            id.to_string(),
+            (PathBuf::from(format!("{id}.typ")), content.to_string()),
+        );
+        WorkspaceSnapshot::from_note_map_with_metadata(&map, metadata_fields)
     }
 
     #[test]
@@ -349,5 +509,50 @@ mod tests {
         let snap = single_note_snapshot("1111111111", &content);
         let status = snap.observe_meta_status(&"1111111111".to_string());
         assert_eq!(status, Status::Done);
+    }
+
+    #[test]
+    fn observe_meta_reads_custom_keys() {
+        let metadata_fields = vec![
+            MetadataFieldConfig {
+                path: "user.kind".to_string(),
+                kind: MetadataFieldKind::String,
+                default: toml::Value::String(String::new()),
+            },
+            MetadataFieldConfig {
+                path: "user.priority".to_string(),
+                kind: MetadataFieldKind::Boolean,
+                default: toml::Value::Boolean(false),
+            },
+            MetadataFieldConfig {
+                path: "user.tags".to_string(),
+                kind: MetadataFieldKind::ArrayString,
+                default: toml::Value::Array(Vec::new()),
+            },
+        ];
+        let content = make_toml_note_with_extra_metadata(
+            "A",
+            "1111111111",
+            "none",
+            "             user.kind = \"project\"\n             user.priority = true\n             user.tags = [\"alpha\", \"beta\"]\n",
+            "",
+        );
+        let snap = single_note_snapshot_with_metadata("1111111111", &content, &metadata_fields);
+
+        assert_eq!(
+            snap.observe_meta(&"1111111111".to_string(), "user.kind"),
+            Value::String("project".to_string())
+        );
+        assert_eq!(
+            snap.observe_meta(&"1111111111".to_string(), "user.priority"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            snap.observe_meta(&"1111111111".to_string(), "user.tags"),
+            Value::List(vec![
+                Value::String("alpha".to_string()),
+                Value::String("beta".to_string())
+            ])
+        );
     }
 }

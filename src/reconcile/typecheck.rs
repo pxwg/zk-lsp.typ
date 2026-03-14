@@ -1,6 +1,8 @@
 /// Static type checker for the Reconcile DSL v1.
 use std::collections::{HashMap, HashSet};
 
+use crate::config::{MetadataFieldConfig, MetadataFieldKind};
+
 use super::ast::{Expr, Module, Rule};
 use super::types::{Type, TypeError};
 
@@ -11,6 +13,7 @@ use super::types::{Type, TypeError};
 struct TypeEnv<'a> {
     module: &'a Module,
     vars: HashMap<String, Type>,
+    metadata_kinds: HashMap<String, Type>,
     /// Rules currently being type-checked (to break mutual recursion).
     visiting: HashSet<String>,
 }
@@ -20,9 +23,33 @@ impl<'a> TypeEnv<'a> {
         TypeEnv {
             module,
             vars: HashMap::new(),
+            metadata_kinds: HashMap::new(),
             visiting: HashSet::new(),
         }
     }
+
+    fn with_metadata(module: &'a Module, metadata_fields: &[MetadataFieldConfig]) -> Self {
+        TypeEnv {
+            module,
+            vars: HashMap::new(),
+            metadata_kinds: metadata_type_map(metadata_fields),
+            visiting: HashSet::new(),
+        }
+    }
+}
+
+fn metadata_type_map(metadata_fields: &[MetadataFieldConfig]) -> HashMap<String, Type> {
+    metadata_fields
+        .iter()
+        .map(|field| {
+            let ty = match field.kind {
+                MetadataFieldKind::String => Type::String,
+                MetadataFieldKind::Boolean => Type::Bool,
+                MetadataFieldKind::ArrayString => Type::List(Box::new(Type::String)),
+            };
+            (field.path.clone(), ty)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +199,7 @@ fn is_builtin(name: &str) -> bool {
 fn rule_return_type(
     rule: &Rule,
     module: &Module,
+    metadata_kinds: &HashMap<String, Type>,
     visiting: &HashSet<String>,
 ) -> Result<Type, TypeError> {
     // Break mutual recursion: if we're already checking this rule, return its expected type.
@@ -181,8 +209,9 @@ fn rule_return_type(
     }
 
     let mut param_env = TypeEnv::new(module);
-    for param in &rule.params {
-        let ty = infer_param_type(&rule.name, param);
+    param_env.metadata_kinds = metadata_kinds.clone();
+    for (index, param) in rule.params.iter().enumerate() {
+        let ty = infer_param_type(&rule.name, param, index);
         param_env.vars.insert(param.clone(), ty);
     }
     // Propagate visiting set + add current rule
@@ -195,7 +224,9 @@ fn rule_return_type(
 
 /// Heuristic expected return type for a rule based on its name.
 fn rule_expected_type(name: &str) -> Type {
-    if name.contains("status") {
+    if name == "effective_meta" {
+        Type::String
+    } else if name.contains("status") {
         Type::Status
     } else if name.contains("checked") {
         Type::Bool
@@ -223,6 +254,9 @@ fn infer_type(expr: &Expr, env: &TypeEnv<'_>) -> Result<Type, TypeError> {
             // "checklist-status" path → Status; any other string path → String.
             match path.as_ref() {
                 Expr::StringLit(s) if s == "checklist-status" => Ok(Type::Status),
+                Expr::StringLit(s) => {
+                    Ok(env.metadata_kinds.get(s).cloned().unwrap_or(Type::String))
+                }
                 _ => Ok(Type::String),
             }
         }
@@ -239,6 +273,14 @@ fn infer_type(expr: &Expr, env: &TypeEnv<'_>) -> Result<Type, TypeError> {
             let then_ty = infer_type(then, env)?;
             let else_ty = infer_type(else_, env)?;
             if then_ty != else_ty {
+                if env.visiting.contains("effective_meta")
+                    && matches!(
+                        (&then_ty, &else_ty),
+                        (Type::Status, Type::String) | (Type::String, Type::Status)
+                    )
+                {
+                    return Ok(Type::String);
+                }
                 return Err(TypeError::IfBranchMismatch {
                     then_type: then_ty,
                     else_type: else_ty,
@@ -250,6 +292,10 @@ fn infer_type(expr: &Expr, env: &TypeEnv<'_>) -> Result<Type, TypeError> {
         Expr::NoteRefLit(_) => Ok(Type::NoteRef),
         Expr::CheckboxRefLit(_) => Ok(Type::CheckboxRef),
         Expr::Call { name, args } => {
+            if name == "effective_meta" {
+                return infer_effective_meta_call_type(args, env);
+            }
+
             // Special case: map(fn_name, list) — first arg is a function name symbol
             if name == "map" {
                 return infer_map_type(args, env);
@@ -257,6 +303,9 @@ fn infer_type(expr: &Expr, env: &TypeEnv<'_>) -> Result<Type, TypeError> {
 
             // Break mutual recursion: if this rule is already being checked, return expected type
             if env.visiting.contains(name.as_str()) {
+                if name == "effective_meta" {
+                    return infer_effective_meta_call_type(args, env);
+                }
                 return Ok(rule_expected_type(name));
             }
 
@@ -276,6 +325,7 @@ fn infer_type(expr: &Expr, env: &TypeEnv<'_>) -> Result<Type, TypeError> {
                 }
                 // Build local env and recursively check body (propagate visiting set)
                 let mut local_env = TypeEnv::new(env.module);
+                local_env.metadata_kinds = env.metadata_kinds.clone();
                 for (param, ty) in rule.params.iter().zip(arg_types.iter()) {
                     local_env.vars.insert(param.clone(), ty.clone());
                 }
@@ -294,6 +344,30 @@ fn infer_type(expr: &Expr, env: &TypeEnv<'_>) -> Result<Type, TypeError> {
             }
 
             Err(TypeError::UnknownFunction(name.clone()))
+        }
+    }
+}
+
+fn infer_effective_meta_call_type(args: &[Expr], env: &TypeEnv<'_>) -> Result<Type, TypeError> {
+    if args.len() != 2 {
+        return Err(TypeError::WrongArgCount {
+            name: "effective_meta".to_string(),
+            expected: 2,
+            got: args.len(),
+        });
+    }
+
+    match &args[1] {
+        Expr::StringLit(s) if s == "checklist-status" => Ok(Type::Status),
+        _ => {
+            let field_ty = infer_type(&args[1], env)?;
+            if field_ty != Type::String {
+                return Err(TypeError::TypeMismatch {
+                    expected: Type::String,
+                    got: field_ty,
+                });
+            }
+            Ok(Type::String)
         }
     }
 }
@@ -346,7 +420,7 @@ fn resolve_fn_return_type(
 ) -> Result<Type, TypeError> {
     // Check user rules
     if let Some(rule) = env.module.rules.iter().find(|r| r.name == fn_name) {
-        return rule_return_type(rule, env.module, &env.visiting);
+        return rule_return_type(rule, env.module, &env.metadata_kinds, &env.visiting);
     }
     // Check builtins
     match fn_name {
@@ -368,10 +442,17 @@ fn resolve_fn_return_type(
 /// - `ns`, `notes`, ends with 's' and starts with 'n' → List(NoteRef)
 /// - `cs`, `cbs`, ends with 's' and starts with 'c' → List(CheckboxRef)
 /// - anything else → NoteRef (default)
-fn infer_param_type(rule_name: &str, param: &str) -> Type {
+fn infer_param_type(rule_name: &str, param: &str, index: usize) -> Type {
     // Rule-name override for well-known rules
     if rule_name == "effective_checked" || param == "c" || param == "cb" || param == "checkbox" {
         return Type::CheckboxRef;
+    }
+    if rule_name == "effective_meta" {
+        return if index == 0 {
+            Type::NoteRef
+        } else {
+            Type::String
+        };
     }
     // List params by convention (e.g. cs, ns, items_ending_in_s)
     if param.ends_with('s') && param.len() > 1 {
@@ -386,11 +467,19 @@ fn infer_param_type(rule_name: &str, param: &str) -> Type {
     Type::NoteRef
 }
 
+#[allow(dead_code)]
 pub fn type_check_module(module: &Module) -> Result<(), TypeError> {
+    type_check_module_with_metadata(module, &[])
+}
+
+pub fn type_check_module_with_metadata(
+    module: &Module,
+    metadata_fields: &[MetadataFieldConfig],
+) -> Result<(), TypeError> {
     for rule in &module.rules {
-        let mut env = TypeEnv::new(module);
-        for param in &rule.params {
-            let ty = infer_param_type(&rule.name, param);
+        let mut env = TypeEnv::with_metadata(module, metadata_fields);
+        for (index, param) in rule.params.iter().enumerate() {
+            let ty = infer_param_type(&rule.name, param, index);
             env.vars.insert(param.clone(), ty);
         }
         // Mark current rule as being visited to break mutual recursion
@@ -407,6 +496,7 @@ pub fn type_check_module(module: &Module) -> Result<(), TypeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{MetadataFieldConfig, MetadataFieldKind};
     use crate::reconcile::default_module::DEFAULT_MODULE;
     use crate::reconcile::parser::parse_module;
 
@@ -478,5 +568,41 @@ mod tests {
         let module = parse(src);
         let err = type_check_module(&module).expect_err("should fail");
         assert!(matches!(err, TypeError::UnknownFunction(_)));
+    }
+
+    #[test]
+    fn effective_meta_with_dynamic_field_typechecks() {
+        let src = r#"
+        (module
+          (define (effective_meta n field)
+            (if (eq? field "checklist-status")
+                (observe_meta n "checklist-status")
+                (observe_meta n field))))
+        "#;
+        let module = parse(src);
+        type_check_module(&module).expect("should typecheck");
+    }
+
+    #[test]
+    fn observe_meta_uses_configured_field_types() {
+        let src = r#"
+        (module
+          (define (bool_field n) (observe_meta n "user.done"))
+          (define (array_field n) (observe_meta n "user.tags")))
+        "#;
+        let module = parse(src);
+        let metadata_fields = vec![
+            MetadataFieldConfig {
+                path: "user.done".to_string(),
+                kind: MetadataFieldKind::Boolean,
+                default: toml::Value::Boolean(false),
+            },
+            MetadataFieldConfig {
+                path: "user.tags".to_string(),
+                kind: MetadataFieldKind::ArrayString,
+                default: toml::Value::Array(Vec::new()),
+            },
+        ];
+        type_check_module_with_metadata(&module, &metadata_fields).expect("should typecheck");
     }
 }

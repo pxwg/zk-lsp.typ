@@ -440,9 +440,9 @@ mod tests {
     #[test]
     fn valid_default_module() {
         let module = parse_module(DEFAULT_MODULE).expect("default module must parse");
-        assert_eq!(module.rules.len(), 2, "expected 2 rules in default module");
+        assert_eq!(module.rules.len(), 3, "expected 3 rules in default module");
         assert!(module.rules.iter().any(|r| r.name == "effective_checked"));
-        assert!(module.rules.iter().any(|r| r.name == "effective_status"));
+        assert!(module.rules.iter().any(|r| r.name == "effective_meta"));
     }
 
     #[test]
@@ -513,5 +513,16 @@ mod tests {
         "#;
         let module = parse_module(src).expect("should parse");
         assert_eq!(module.rules.len(), 1);
+    }
+
+    #[test]
+    fn define_two_param_rule() {
+        let src = r#"
+        (module
+          (define (effective_meta n field)
+            (observe_meta n field)))
+        "#;
+        let module = parse_module(src).expect("should parse");
+        assert_eq!(module.rules[0].params, vec!["n", "field"]);
     }
 }

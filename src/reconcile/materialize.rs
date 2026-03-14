@@ -16,8 +16,17 @@ pub struct ReconcileResult {
 
 /// v1: identity — materialized == effective.
 pub fn materialize(eval: EvalResult) -> ReconcileResult {
+    let materialized_status = eval
+        .effective_meta
+        .iter()
+        .filter_map(|((note_id, field), value)| match (field.as_str(), value) {
+            ("checklist-status", Value::Status(status)) => Some((note_id.clone(), status.clone())),
+            _ => None,
+        })
+        .collect();
+
     ReconcileResult {
-        materialized_status: eval.effective_status,
+        materialized_status,
         materialized_meta: eval.effective_meta,
         materialized_checked: eval.effective_checked,
         diagnostics: eval.diagnostics,
@@ -65,10 +74,12 @@ mod tests {
 
         let result = materialize(eval_result);
 
-        // v1 identity: materialized status should equal what was evaluated
+        // checklist-status now materializes from the generic meta map.
         assert_eq!(
-            result.materialized_status.get("1111111111"),
-            Some(&Status::Done)
+            result
+                .materialized_meta
+                .get(&("1111111111".to_string(), "checklist-status".to_string())),
+            Some(&Value::Status(Status::Done))
         );
         assert!(result.diagnostics.is_empty());
     }

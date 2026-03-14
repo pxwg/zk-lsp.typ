@@ -19,13 +19,13 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use crate::config::WikiConfig;
-use crate::handlers::formatting::normalize_note_from_checked;
+use crate::handlers::formatting::{apply_metadata_patch, normalize_note_from_checked};
 
 use self::default_module::DEFAULT_MODULE;
 use self::eval::eval_all;
 use self::materialize::materialize;
 use self::observe::WorkspaceSnapshot;
-use self::types::NoteId;
+use self::types::{NoteId, Value};
 
 // ---------------------------------------------------------------------------
 // Public stats
@@ -45,12 +45,13 @@ pub async fn run_reconcile(config: &WikiConfig, dry_run: bool) -> Result<Reconci
 
     // 2. Build workspace snapshot from already-scanned notes (avoids double I/O).
     //    Cycle detection is handled by the evaluator via visiting_meta / CyclePolicy.
-    let snapshot = WorkspaceSnapshot::from_note_map(&notes);
+    let snapshot =
+        WorkspaceSnapshot::from_note_map_with_metadata(&notes, &config.zk_config.metadata.fields);
 
     // 3. Parse + type-check DEFAULT_MODULE (panics on failure — compile-time invariant)
     let module = parser::parse_module(DEFAULT_MODULE)
         .expect("DEFAULT_MODULE must always parse successfully");
-    typecheck::type_check_module(&module)
+    typecheck::type_check_module_with_metadata(&module, &config.zk_config.metadata.fields)
         .expect("DEFAULT_MODULE must always typecheck successfully");
 
     // 4. Evaluate
@@ -79,7 +80,9 @@ pub async fn run_reconcile(config: &WikiConfig, dry_run: bool) -> Result<Reconci
             .map(|(cid, checked)| (cid.line_idx, *checked))
             .collect();
 
-        let new_content = normalize_note_from_checked(content, &checked_by_line);
+        let after_checked = normalize_note_from_checked(content, &checked_by_line);
+        let new_content = apply_materialized_status(&_id, &after_checked, &reconcile_result)
+            .unwrap_or_else(|| after_checked.clone());
         if new_content != *content {
             files_changed += 1;
             if !dry_run {
@@ -94,6 +97,27 @@ pub async fn run_reconcile(config: &WikiConfig, dry_run: bool) -> Result<Reconci
     }
 
     Ok(ReconcileStats { files_changed })
+}
+
+fn apply_materialized_status(
+    note_id: &str,
+    content: &str,
+    reconcile_result: &materialize::ReconcileResult,
+) -> Option<String> {
+    let status = reconcile_result
+        .materialized_meta
+        .get(&(note_id.to_string(), "checklist-status".to_string()))?;
+
+    let Value::Status(status) = status else {
+        return None;
+    };
+
+    let mut patch = HashMap::new();
+    patch.insert(
+        "checklist-status".to_string(),
+        toml::Value::String(status.to_str().to_string()),
+    );
+    apply_metadata_patch(content, &patch).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +162,7 @@ mod tests {
     use crate::reconcile::eval::eval_all;
     use crate::reconcile::observe::WorkspaceSnapshot;
     use crate::reconcile::parser::parse_module;
-    use crate::reconcile::types::{DiagnosticKind, Status};
+    use crate::reconcile::types::{DiagnosticKind, Status, Value};
 
     fn make_toml_note(title: &str, id: &str, status: &str, body: &str) -> String {
         format!(
@@ -185,16 +209,22 @@ mod tests {
         let result = materialize(eval_result);
 
         assert_eq!(
-            result.materialized_status.get("1010101010"),
-            Some(&Status::Done)
+            result
+                .materialized_meta
+                .get(&("1010101010".to_string(), "checklist-status".to_string())),
+            Some(&Value::Status(Status::Done))
         );
         assert_eq!(
-            result.materialized_status.get("2020202020"),
-            Some(&Status::Done)
+            result
+                .materialized_meta
+                .get(&("2020202020".to_string(), "checklist-status".to_string())),
+            Some(&Value::Status(Status::Done))
         );
         assert_eq!(
-            result.materialized_status.get("3030303030"),
-            Some(&Status::Done)
+            result
+                .materialized_meta
+                .get(&("3030303030".to_string(), "checklist-status".to_string())),
+            Some(&Value::Status(Status::Done))
         );
     }
 
@@ -333,6 +363,23 @@ mod tests {
                 .iter()
                 .any(|d| d.kind == DiagnosticKind::Cycle),
             "cycle diagnostic emitted"
+        );
+    }
+
+    #[test]
+    fn materialized_meta_drives_status_writeback() {
+        let note = make_toml_note("A", "1111111111", "none", "- [x] finished\n");
+        let snap = snapshot_from(&[("1111111111", &note)]);
+        let module = parse_module(DEFAULT_MODULE).expect("parse");
+        let result = materialize(eval_all(&module, &snap));
+
+        let updated = apply_materialized_status("1111111111", &note, &result).expect("status edit");
+        assert!(updated.contains("checklist-status = \"done\""));
+        assert_eq!(
+            result
+                .materialized_meta
+                .get(&("1111111111".to_string(), "checklist-status".to_string())),
+            Some(&Value::Status(Status::Done))
         );
     }
 }

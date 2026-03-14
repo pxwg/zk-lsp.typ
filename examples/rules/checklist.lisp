@@ -14,11 +14,16 @@
   (define (effective_checked c)
     (if (empty? (targets c))
         (observe_checked c)
-        (all_done (map effective_status (targets c)))))
+        (all_done (map target_status (targets c)))))
 
-  (define (effective_status n)
-    (if (eq? (observe_meta n "relation") "archived")
-        done
-        (if (empty? (local_checkboxes n))
-            (observe_meta n "checklist-status")
-            (aggregate_status (map effective_checked (local_checkboxes n)))))))
+  (define (target_status n)
+    (effective_meta n "checklist-status"))
+
+  (define (effective_meta n field)
+    (if (eq? field "checklist-status")
+        (if (eq? (observe_meta n "relation") "archived")
+            done
+            (if (empty? (local_checkboxes n))
+                (observe_meta n "checklist-status")
+                (aggregate_status (map effective_checked (local_checkboxes n)))))
+        (observe_meta n field))))
