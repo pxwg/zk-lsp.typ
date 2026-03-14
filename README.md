@@ -55,6 +55,13 @@ zk-lsp --wiki-root ~/my-wiki lsp
 export WIKI_ROOT=~/my-wiki
 ```
 
+For LSP clients, `zk-lsp` resolves the wiki root in this order:
+
+1. `--wiki-root`
+2. `WIKI_ROOT`
+3. LSP initialization data: `initializationOptions.root_dir`, `initializationOptions.rootDir`, `initializationOptions.wikiRoot`, `rootUri`, then `workspaceFolders[0]`
+4. `~/wiki`
+
 ## Wiki Structure
 
 ```
@@ -390,7 +397,25 @@ Add to your Neovim config (requires Neovim 0.11+):
 return {
   cmd = { "zk-lsp", "lsp" },
   filetypes = { "typst" },
-  root_dir = vim.fn.expand("~/wiki"),
+  root_dir = function(bufnr)
+    return vim.fs.root(bufnr, { "zk-lsp.toml", ".git" }) or vim.fn.expand("~/wiki")
+  end,
+  offset_encoding = "utf-16",
+}
+```
+
+`zk-lsp` now reads the LSP workspace root from the client, so Neovim's `root_dir` can directly control the wiki root. If your client setup sends custom init options instead, this also works:
+
+```lua
+return {
+  cmd = { "zk-lsp", "lsp" },
+  filetypes = { "typst" },
+  root_dir = function(bufnr)
+    return vim.fs.root(bufnr, { "zk-lsp.toml", ".git" }) or vim.fn.expand("~/wiki")
+  end,
+  init_options = {
+    root_dir = vim.fn.expand("~/wiki"),
+  },
   offset_encoding = "utf-16",
 }
 ```
