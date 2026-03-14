@@ -253,8 +253,10 @@ Custom fields are preserved by the parser and included in `note-info` JSON outpu
 
 By default, the built-in module provides the standard checklist behavior:
 
-- local checkbox leaves aggregate to `todo` / `wip` / `done`
+- `local_checkboxes(n)` returns all checklist items in source order
+- `children(c)` returns direct child checklist items in source order
 - ref checkboxes derive from their target notes
+- local non-leaf parents ignore their own `[ ]` / `[x]`; child state determines them
 - multi-target refs require `all_done`
 - archived notes are forced to `done`
 
@@ -304,6 +306,13 @@ Each configured file must contain a full `(module ...)` form. A minimal custom m
 ```
 
 You can also include helper rules and an optional `(policy ...)` block.
+
+The built-in tree primitive semantics are:
+
+- `local_checkboxes(n)`: all checklist items in note `n`, preserving source order
+- `children(c)`: direct children of checkbox `c` in the same note, preserving source order
+
+`children(c)` uses the parsed checklist tree: items after `c` with deeper indentation, stopping at the first checklist item whose indentation is less than or equal to `c`; only the next indentation layer counts as direct children.
 
 ### Merge semantics
 
@@ -445,8 +454,6 @@ The server advertises these capabilities:
 | `@ID` references an archived note | Warning | `Note @ID is archived. New version: @ALT` |
 | `@ID` references a legacy note | Info | `Note @ID is legacy. Newer insights: @EVO` |
 | `@ID` participates in a cyclic dependency | Error | `cyclic task dependency detected` |
-| Ref checklist item has child items, so its `@ID` targets would be ignored semantically | Error | `Ref item has child items; @ID targets will be semantically ignored` |
-
 **Legacy suppression**: if a legacy reference is immediately followed by its evolution ID on the same line (`@old @new`), the diagnostic is suppressed.
 
 `reconcile`-driven diagnostics are position-aware and shared between the LSP and CLI paths. When a workspace-wide reconcile error involves multiple source locations, `zk-lsp` reports all of them so the problem is visible from any participating note or `@ID` occurrence.
@@ -541,10 +548,15 @@ See `lua/zk_hook_types.lua` for the full EmmyLua type reference and `examples/ho
 
 The default module reproduces the built-in checklist behavior:
 
-- Local checkbox leaves aggregate to `todo` / `wip` / `done`
+- `local_checkboxes(n)` exposes all checklist items in source order
+- `children(c)` exposes direct child checklist items in source order
 - Ref checkboxes derive from their target notes
+- Local non-leaf parents ignore their own `[ ]` / `[x]`; their children decide them
+- Ref parents require both their own targets and their direct children to be done
 - Multi-target refs require `all_done`
 - Archived notes are forced to `done`
+
+This behavior is expressed in the default DSL rules, not hard-coded in Rust. Rust provides the observed checklist tree; the module decides how that tree affects `effective_checked` and `checklist-status`.
 
 If you provide custom rule modules, they replace or extend that default behavior according to the merge rules above.
 
