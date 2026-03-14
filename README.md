@@ -318,7 +318,7 @@ Each configured file must contain a full `(module ...)` form. A minimal custom m
 
 You can also include helper rules and an optional `(policy ...)` block.
 
-`materialized_fields(n)` declares which metadata fields should be re-computed and written back for note `n`. The default checklist module returns only `"checklist-status"`, but custom modules can materialize multiple fields.
+`materialized_fields(n)` declares which metadata fields should be re-computed and written back for note `n`. The default checklist module returns only `"checklist-status"`, but custom modules can materialize multiple fields. If a declared field cannot be patched into the note's TOML metadata block, `zk-lsp reconcile` now fails explicitly instead of silently skipping it.
 
 The built-in tree primitive semantics are:
 
@@ -328,6 +328,7 @@ The built-in tree primitive semantics are:
 The built-in status/value semantics are:
 
 - `observe_checked(c)`: returns a `Status` (`done`/`todo`) rather than a boolean
+- `observe_meta(n, field)`: reads typed core/configured metadata fields and otherwise falls back to `String`, so arbitrary flattened TOML leaf keys remain readable
 - `aggregate_status(xs)`: accepts `List(Status)` and returns a `Status`
 - `list(x...)`: constructs a `List` value, typically for `materialized_fields`
 - `empty?`, `all_done`, `eq?`, `not`, `and`, `or`, `done?`, `todo?`, `wip?`, `none?`: return `Bool` for control flow
@@ -583,7 +584,7 @@ See `lua/zk_hook_types.lua` for the full EmmyLua type reference and `examples/ho
 5. Evaluates `effective_checked` for every checkbox, then evaluates `materialized_fields` and `effective_meta` for every note, with unified call-stack cycle detection
 6. Collects reconcile diagnostics with file/span locations; cycle diagnostics also include related locations for the other edges in the same cycle
 7. If any reconcile diagnostic exists, aborts and reports all of them in Typst-style CLI output
-8. Otherwise writes back changed checkbox states and every metadata field declared by `materialized_fields`
+8. Otherwise writes back changed checkbox states and every metadata field declared by `materialized_fields`; if any declared metadata field cannot be written back, the reconcile run fails
 
 The default module reproduces the built-in checklist behavior:
 

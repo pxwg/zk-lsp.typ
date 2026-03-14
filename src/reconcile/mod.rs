@@ -71,7 +71,7 @@ pub async fn run_reconcile(config: &WikiConfig, dry_run: bool) -> Result<Reconci
             .collect();
 
         let after_checked = normalize_note_from_checked(content, &checked_by_line);
-        let new_content = apply_materialized_metadata(&_id, &after_checked, &reconcile_result)
+        let new_content = apply_materialized_metadata(&_id, &after_checked, &reconcile_result)?
             .unwrap_or_else(|| after_checked.clone());
         if new_content != *content {
             files_changed += 1;
@@ -116,7 +116,7 @@ fn apply_materialized_metadata(
     note_id: &str,
     content: &str,
     reconcile_result: &materialize::ReconcileResult,
-) -> Option<String> {
+) -> Result<Option<String>> {
     let mut patch = HashMap::new();
     for ((materialized_note_id, field), value) in &reconcile_result.materialized_meta {
         if materialized_note_id != note_id {
@@ -128,9 +128,13 @@ fn apply_materialized_metadata(
         patch.insert(field.clone(), toml_value);
     }
     if patch.is_empty() {
-        return None;
+        return Ok(None);
     }
-    apply_metadata_patch(content, &patch).ok()
+    apply_metadata_patch(content, &patch)
+        .map(Some)
+        .map_err(|err| {
+            anyhow::anyhow!("failed to write materialized metadata for note {note_id}: {err}")
+        })
 }
 
 fn value_to_toml(value: &Value) -> Option<toml::Value> {
@@ -882,8 +886,9 @@ mod tests {
         let module = load_test_module();
         let result = materialize(eval_all(&module, &snap));
 
-        let updated =
-            apply_materialized_metadata("1111111111", &note, &result).expect("status edit");
+        let updated = apply_materialized_metadata("1111111111", &note, &result)
+            .expect("status edit")
+            .expect("metadata change");
         assert!(updated.contains("checklist-status = \"done\""));
         assert_eq!(
             result
@@ -925,10 +930,48 @@ mod tests {
              = A <1111111111>\n";
         let snap = snapshot_from(&[("1111111111", note)]);
         let result = materialize(eval_all(&module, &snap));
-        let updated =
-            apply_materialized_metadata("1111111111", note, &result).expect("metadata edit");
+        let updated = apply_materialized_metadata("1111111111", note, &result)
+            .expect("metadata edit")
+            .expect("metadata change");
 
         assert!(updated.contains("checklist-status = \"done\""));
         assert!(updated.contains("user.label = \"synced\""));
+    }
+
+    #[test]
+    fn materialized_meta_missing_key_fails_instead_of_silently_skipping() {
+        let src = r#"
+        (module
+          (define (materialized_fields n)
+            (list "user.label"))
+          (define (effective_checked c)
+            (observe_checked c))
+          (define (effective_meta n field)
+            (if (eq? field "user.label")
+                "synced"
+                (observe_meta n field))))
+        "#;
+        let module = parse_module(src).expect("parse");
+        let note = "#import \"../include.typ\": *\n\
+             #let zk-metadata = toml(bytes(\n\
+             \x20 ```toml\n\
+             \x20 schema-version = 1\n\
+             \x20 title = \"A\"\n\
+             \x20 tags = []\n\
+             \x20 checklist-status = \"none\"\n\
+             \x20 generated = false\n\
+             \x20 ```.text,\n\
+             ))\n\
+             #show: zettel.with(metadata: zk-metadata)\n\
+             \n\
+             = A <1111111111>\n";
+        let snap = snapshot_from(&[("1111111111", note)]);
+        let result = materialize(eval_all(&module, &snap));
+        let err =
+            apply_materialized_metadata("1111111111", note, &result).expect_err("should fail");
+
+        assert!(err
+            .to_string()
+            .contains("failed to write materialized metadata"));
     }
 }

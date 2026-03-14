@@ -120,7 +120,6 @@ impl fmt::Display for ParseError {
 pub enum TypeError {
     UnknownVariable(String),
     UnknownFunction(String),
-    UnknownMetadataField(String),
     TypeMismatch {
         expected: Type,
         got: Type,
@@ -144,9 +143,6 @@ impl fmt::Display for TypeError {
         match self {
             TypeError::UnknownVariable(v) => write!(f, "unknown variable '{v}'"),
             TypeError::UnknownFunction(n) => write!(f, "unknown function '{n}'"),
-            TypeError::UnknownMetadataField(field) => {
-                write!(f, "unknown metadata field '{field}'")
-            }
             TypeError::TypeMismatch { expected, got } => {
                 write!(f, "type mismatch: expected {expected}, got {got}")
             }
