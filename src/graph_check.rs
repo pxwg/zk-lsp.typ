@@ -122,7 +122,7 @@ pub async fn check_graph(config: &WikiConfig) -> anyhow::Result<CheckReport> {
 
 /// Render the check report in Typst-error style for CLI output (stdout).
 pub fn render_check_report(report: &CheckReport) -> String {
-    let color = std::io::stdout().is_terminal();
+    let color = stdout_color_enabled();
     let mut out = String::new();
 
     for entry in &report.dead_links {
@@ -206,6 +206,10 @@ pub fn render_check_report(report: &CheckReport) -> String {
 
 fn display_width(s: &str) -> usize {
     s.width()
+}
+
+fn stdout_color_enabled() -> bool {
+    !cfg!(test) && std::io::stdout().is_terminal()
 }
 
 // ---------------------------------------------------------------------------

@@ -251,7 +251,7 @@ fn render_diagnostics(
     diagnostics: &[ReconcileDiagnostic],
     notes: &HashMap<NoteId, (PathBuf, String)>,
 ) -> String {
-    let color = std::io::stderr().is_terminal();
+    let color = stderr_color_enabled();
     let mut out = String::new();
 
     for diag in diagnostics {
@@ -318,6 +318,10 @@ fn render_diagnostics(
 
 fn display_width(s: &str) -> usize {
     s.width()
+}
+
+fn stderr_color_enabled() -> bool {
+    !cfg!(test) && std::io::stderr().is_terminal()
 }
 
 // ---------------------------------------------------------------------------

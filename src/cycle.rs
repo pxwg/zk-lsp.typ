@@ -131,7 +131,7 @@ pub fn detect_cycles(graph: &DependencyGraph) -> Vec<DependencyCycle> {
 /// ANSI colours are emitted only when stderr is a TTY.
 #[allow(dead_code)]
 pub fn render_cycle_errors(cycles: &[DependencyCycle]) -> String {
-    let color = std::io::stderr().is_terminal();
+    let color = stderr_color_enabled();
     let mut out = String::new();
     for cycle in cycles {
         // "error: cyclic task dependency detected"
@@ -200,6 +200,10 @@ pub fn render_cycle_errors(cycles: &[DependencyCycle]) -> String {
         }
     }
     out
+}
+
+fn stderr_color_enabled() -> bool {
+    !cfg!(test) && std::io::stderr().is_terminal()
 }
 
 /// Count terminal display columns for `s` (CJK chars = 2 columns, others = 1).
