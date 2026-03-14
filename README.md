@@ -298,7 +298,7 @@ Rule files are merged in this order:
 2. User-level `[[reconcile.rule]]` files, in config order
 3. Project-level `[[reconcile.rule]]` files, in config order
 
-If `disable_default_reconcile_rules = true`, step 1 is skipped and only your configured files are loaded. In that mode you must provide at least `effective_checked` and `effective_meta` yourself.
+If `disable_default_reconcile_rules = true`, step 1 is skipped and only your configured files are loaded. In that mode you must provide at least `materialized_fields`, `effective_checked`, and `effective_meta` yourself.
 
 ### File requirements
 
@@ -306,6 +306,9 @@ Each configured file must contain a full `(module ...)` form. A minimal custom m
 
 ```lisp
 (module
+  (define (materialized_fields n)
+    (list "checklist-status"))
+
   (define (effective_checked c)
     (observe_checked c))
 
@@ -314,6 +317,8 @@ Each configured file must contain a full `(module ...)` form. A minimal custom m
 ```
 
 You can also include helper rules and an optional `(policy ...)` block.
+
+`materialized_fields(n)` declares which metadata fields should be re-computed and written back for note `n`. The default checklist module returns only `"checklist-status"`, but custom modules can materialize multiple fields.
 
 The built-in tree primitive semantics are:
 
@@ -324,6 +329,7 @@ The built-in status/value semantics are:
 
 - `observe_checked(c)`: returns a `Status` (`done`/`todo`) rather than a boolean
 - `aggregate_status(xs)`: accepts `List(Status)` and returns a `Status`
+- `list(x...)`: constructs a `List` value, typically for `materialized_fields`
 - `empty?`, `all_done`, `eq?`, `not`, `and`, `or`, `done?`, `todo?`, `wip?`, `none?`: return `Bool` for control flow
 - checklist rules should compute in `Status`; `Bool` is reserved for predicates and `if`
 
@@ -574,10 +580,10 @@ See `lua/zk_hook_types.lua` for the full EmmyLua type reference and `examples/ho
 2. Loads the built-in reconcile module
 3. Loads and merges any configured `[[reconcile.rule]]` files from disk
 4. Parses and type-checks the merged module against the builtin function surface
-5. Evaluates `effective_checked` and `effective_meta` across the workspace with unified call-stack cycle detection
+5. Evaluates `materialized_fields`, `effective_checked`, and `effective_meta` across the workspace with unified call-stack cycle detection
 6. Collects reconcile diagnostics with precise file and span locations
 7. If any reconcile diagnostic exists, aborts and reports all of them in Typst-style CLI output
-8. Otherwise writes back changed checkbox states and the materialized `checklist-status`
+8. Otherwise writes back changed checkbox states and every metadata field declared by `materialized_fields`
 
 The default module reproduces the built-in checklist behavior:
 
@@ -590,13 +596,31 @@ The default module reproduces the built-in checklist behavior:
 - Multi-target refs require `all_done`
 - Archived notes are forced to `done`
 
-This behavior is expressed in the default DSL rules, not hard-coded in Rust. Rust provides the builtin observations (`observe_checked`, `observe_meta`, `targets`, `children`, `local_checkboxes`) and the default module decides how they affect `effective_checked` and `checklist-status`.
+This behavior is expressed in the default DSL rules, not hard-coded in Rust. Rust provides the builtin observations (`observe_checked`, `observe_meta`, `targets`, `children`, `local_checkboxes`) and the default module decides which metadata fields to materialize and how they affect `effective_checked` and `effective_meta`.
 
 If you provide custom rule modules, they replace or extend that default behavior according to the merge rules above.
 
 If `disable_default_reconcile_rules = true`, `zk-lsp reconcile` evaluates only your configured DSL modules and does not preload `examples/rules/checklist.lisp`.
 
 Use `--dry-run` to preview changes without writing files.
+
+Minimal multi-field example:
+
+```lisp
+(module
+  (define (materialized_fields n)
+    (list "checklist-status" "user.label"))
+
+  (define (effective_checked c)
+    (observe_checked c))
+
+  (define (effective_meta n field)
+    (if (eq? field "checklist-status")
+        done
+        (if (eq? field "user.label")
+            "synced"
+            (observe_meta n field)))))
+```
 
 ## Example Usages
 
