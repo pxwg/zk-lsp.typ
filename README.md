@@ -82,7 +82,7 @@ Each note filename is a 10-digit timestamp (`YYMMDDHHMM`). Notes use the TOML fo
 schema-version = 1
 title = "Note Title"
 tags = []
-checklist-status = "none"   # or "active", "done", "archived"
+checklist-status = "none"   # or "active", "done"
 generated = false
 ```))
 #show: zettel
@@ -652,7 +652,7 @@ You can use zettelkasten notes as task management tools by adding checklist entr
 4. `zk-lsp reconcile` computes cross-file checkbox truth and writes back checkbox states plus any metadata fields declared by `materialized_fields`
 5. When an idea is no longer useful, e.g.:
   - The note is superseded by a newer version: changing the metadata from `relation = "active"` to `relation = "legacy"`, and optionally adding some relation notes with `relation-target = ["<id1>",...]` to point to the newer insights
-  - The note is manually archived by the user: changing the metadata to `checklist-status = "archived"` and optionally adding `relation-target = ["<id1>",...]` to point to the successor note(s)
+  - The note is manually archived by the user: changing the metadata to `relation = "archived"` and optionally adding `relation-target = ["<id1>",...]` to point to the successor note(s)
   - The action above could be simplified with:
     - A code action on the note to mark it as legacy, archived or active
     - A completion for adding `relation-target` entries that lists note titles for easy linking
