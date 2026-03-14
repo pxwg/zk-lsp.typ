@@ -12,6 +12,7 @@ pub mod observe;
 pub mod parser;
 pub mod typecheck;
 pub mod types;
+pub mod writeback;
 
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -23,7 +24,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::config::WikiConfig;
 use crate::cycle;
 use crate::dependency_graph;
-use crate::handlers::formatting::{apply_metadata_patch, normalize_note_from_checked};
+use crate::handlers::formatting::apply_metadata_patch;
 
 use self::default_module::load_module;
 use self::materialize::materialize;
@@ -31,6 +32,7 @@ use self::observe::WorkspaceSnapshot;
 use self::types::{
     DiagnosticKind, DiagnosticLocation, DiagnosticSeverity, NoteId, ReconcileDiagnostic, Value,
 };
+use self::writeback::normalize_note_from_checked;
 
 // ---------------------------------------------------------------------------
 // Public stats
@@ -447,7 +449,7 @@ mod tests {
 
     #[test]
     fn refitem_rendered_checked_not_source_truth() {
-        use crate::handlers::formatting::is_note_done_with_deps;
+        use crate::reconcile::writeback::is_note_done_with_deps;
         let content = "- [x] @2222222222\n";
         let deps = HashMap::from([("2222222222".to_string(), false)]);
         assert!(
@@ -458,7 +460,7 @@ mod tests {
 
     #[test]
     fn refitem_drives_note_status() {
-        use crate::handlers::formatting::is_note_done_with_deps;
+        use crate::reconcile::writeback::is_note_done_with_deps;
         let content_a = make_toml_note(
             "A",
             "1111111111",
@@ -481,7 +483,7 @@ mod tests {
 
     #[test]
     fn normalize_note_is_local_only() {
-        use crate::handlers::formatting::normalize_note;
+        use crate::reconcile::writeback::normalize_note;
         let content = make_toml_note("A", "1111111111", "none", "- [ ] @2222222222\n");
         let deps = HashMap::from([("2222222222".to_string(), true)]);
         let result = normalize_note(&content, &deps);
@@ -491,7 +493,7 @@ mod tests {
 
     #[test]
     fn normalize_note_is_pure() {
-        use crate::handlers::formatting::normalize_note;
+        use crate::reconcile::writeback::normalize_note;
         let content = "- [ ] @1234567890 do thing\n";
         let mut dep_states = HashMap::new();
         dep_states.insert("1234567890".to_string(), true);
@@ -501,7 +503,7 @@ mod tests {
 
     #[test]
     fn chain_propagation() {
-        use crate::handlers::formatting::{is_note_done, normalize_note};
+        use crate::reconcile::writeback::{is_note_done, normalize_note};
         let content_a = make_toml_note("A", "1010101010", "done", "");
         let content_b = make_toml_note("B", "2020202020", "none", "- [ ] @1010101010\n");
         let content_c = make_toml_note("C", "3030303030", "none", "- [ ] @2020202020\n");
@@ -532,7 +534,7 @@ mod tests {
 
     #[test]
     fn multi_ref_item_requires_all_done() {
-        use crate::handlers::formatting::is_note_done_with_deps;
+        use crate::reconcile::writeback::is_note_done_with_deps;
         let content = make_toml_note("X", "3333333333", "none", "- [ ] @1111111111 @2222222222\n");
 
         let deps_both = HashMap::from([
@@ -626,7 +628,7 @@ mod tests {
 
     #[test]
     fn no_checklist_note_uses_metadata_status() {
-        use crate::handlers::formatting::is_note_done_with_deps;
+        use crate::reconcile::writeback::is_note_done_with_deps;
         let content_done = make_toml_note("D", "4444444444", "done", "");
         let content_none = make_toml_note("N", "5555555555", "none", "");
         assert!(is_note_done_with_deps(&content_done, &HashMap::new()));

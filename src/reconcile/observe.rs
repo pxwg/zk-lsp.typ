@@ -99,6 +99,10 @@ impl WorkspaceSnapshot {
         self.notes.keys()
     }
 
+    pub fn all_checkbox_ids(&self) -> impl Iterator<Item = &CheckboxId> {
+        self.checkboxes.keys()
+    }
+
     #[allow(dead_code)]
     pub fn note_obs(&self, note_id: &NoteId) -> Option<&NoteObs> {
         self.notes.get(note_id)

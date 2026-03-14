@@ -441,6 +441,14 @@ pub fn eval_all_typed(
     type_info: &TypeInfo,
 ) -> EvalResult {
     let mut ev = Evaluator::new(module, snapshot, type_info);
+
+    for checkbox_id in snapshot.all_checkbox_ids() {
+        let _ = ev.invoke_function(
+            "effective_checked",
+            vec![Value::CheckboxRef(checkbox_id.clone())],
+        );
+    }
+
     for note_id in snapshot.all_note_ids() {
         let fields = ev
             .invoke_function("materialized_fields", vec![Value::NoteRef(note_id.clone())])
@@ -655,5 +663,25 @@ mod tests {
         let module = default_module();
         let result = eval_all(&module, &snap);
         assert_eq!(effective_status(&result, "1111111111"), Some(Status::Done));
+    }
+
+    #[test]
+    fn effective_checked_is_evaluated_for_all_checkboxes() {
+        let src = r#"
+        (module
+          (define (materialized_fields n) (list))
+          (define (effective_checked c) done)
+          (define (effective_meta n field) (observe_meta n field)))
+        "#;
+        let module = parse_module(src).expect("module parses");
+        let content = make_toml_note("A", "1111111111", "none", "- [ ] task\n");
+        let snap = snapshot_from(&[("1111111111", &content)]);
+        let result = eval_all(&module, &snap);
+
+        assert_eq!(result.effective_checked.len(), 1);
+        assert!(result
+            .effective_checked
+            .values()
+            .all(|status| *status == Status::Done));
     }
 }
