@@ -24,7 +24,6 @@ use crate::config::WikiConfig;
 use crate::cycle;
 use crate::dependency_graph;
 use crate::handlers::formatting::{apply_metadata_patch, normalize_note_from_checked};
-use crate::parser as note_parser;
 
 use self::default_module::load_module;
 use self::eval::eval_all;
@@ -182,7 +181,6 @@ fn build_diagnostics(
     let graph = dependency_graph::build_dependency_graph(notes);
     let cycles = cycle::detect_cycles(&graph);
     let mut diagnostics = cycle_diagnostics(&cycles);
-    diagnostics.extend(non_leaf_ref_diagnostics(notes));
     diagnostics.extend(located_eval_diagnostics(eval_diagnostics, notes));
     diagnostics
 }
@@ -208,49 +206,6 @@ fn cycle_diagnostics(cycles: &[cycle::DependencyCycle]) -> Vec<ReconcileDiagnost
             });
         }
     }
-    diagnostics
-}
-
-fn non_leaf_ref_diagnostics(
-    notes: &HashMap<NoteId, (PathBuf, String)>,
-) -> Vec<ReconcileDiagnostic> {
-    let mut diagnostics = Vec::new();
-
-    for (note_id, (path, content)) in notes {
-        let items = note_parser::parse_checklist_items(content);
-        let lines: Vec<&str> = content.lines().collect();
-
-        for (i, item) in items.iter().enumerate() {
-            let note_parser::ChecklistItemKind::Ref { targets } = &item.kind else {
-                continue;
-            };
-            let is_non_leaf = i + 1 < items.len() && items[i + 1].indent > item.indent;
-            if !is_non_leaf {
-                continue;
-            }
-
-            let line_text = lines.get(item.line_idx).copied().unwrap_or("");
-            let (start_byte, end_byte) = targets
-                .first()
-                .zip(targets.last())
-                .map(|(first, last)| (first.byte_start, last.byte_end))
-                .unwrap_or((0, line_text.len() as u32));
-
-            diagnostics.push(ReconcileDiagnostic {
-                note_id: note_id.clone(),
-                message: "Ref item has child items; @ID targets will be semantically ignored (only leaf items are source facts)".to_string(),
-                kind: DiagnosticKind::NonLeafRef,
-                severity: DiagnosticSeverity::Error,
-                location: Some(DiagnosticLocation {
-                    file_path: path.clone(),
-                    line: item.line_idx,
-                    byte_start: start_byte,
-                    byte_end: end_byte,
-                }),
-            });
-        }
-    }
-
     diagnostics
 }
 
@@ -580,6 +535,55 @@ mod tests {
     }
 
     #[test]
+    fn parent_ref_with_done_target_and_done_children_marks_note_done() {
+        let dep = make_toml_note("Dep", "1111111111", "done", "");
+        let parent = make_toml_note(
+            "Parent",
+            "2222222222",
+            "none",
+            "- [ ] @1111111111\n  - [x] child 1\n  - [x] child 2\n",
+        );
+
+        let snap = snapshot_from(&[("1111111111", &dep), ("2222222222", &parent)]);
+        let module = load_test_module();
+        let result = materialize(eval_all(&module, &snap));
+
+        assert_eq!(
+            result
+                .materialized_meta
+                .get(&("2222222222".to_string(), "checklist-status".to_string())),
+            Some(&Value::Status(Status::Done))
+        );
+    }
+
+    #[test]
+    fn nested_ref_parent_and_structural_local_parent_produce_done_status() {
+        let top_dep = make_toml_note("TopDep", "1111111111", "done", "");
+        let leaf_dep = make_toml_note("LeafDep", "3333333333", "done", "");
+        let note = make_toml_note(
+            "Parent",
+            "2222222222",
+            "none",
+            "- [ ] @1111111111\n  - [ ] group\n    - [ ] @3333333333\n",
+        );
+
+        let snap = snapshot_from(&[
+            ("1111111111", &top_dep),
+            ("2222222222", &note),
+            ("3333333333", &leaf_dep),
+        ]);
+        let module = load_test_module();
+        let result = materialize(eval_all(&module, &snap));
+
+        assert_eq!(
+            result
+                .materialized_meta
+                .get(&("2222222222".to_string(), "checklist-status".to_string())),
+            Some(&Value::Status(Status::Done))
+        );
+    }
+
+    #[test]
     fn no_checklist_note_uses_metadata_status() {
         use crate::handlers::formatting::is_note_done_with_deps;
         let content_done = make_toml_note("D", "4444444444", "done", "");
@@ -627,26 +631,6 @@ mod tests {
             .all(|diag| diag.severity == DiagnosticSeverity::Error));
     }
 
-    #[test]
-    fn non_leaf_ref_diagnostics_include_source_locations() {
-        let notes = note_map(&[(
-            "1111111111",
-            make_toml_note(
-                "A",
-                "1111111111",
-                "none",
-                "- [ ] @2222222222\n  - [ ] child\n",
-            ),
-        )]);
-
-        let diagnostics = non_leaf_ref_diagnostics(&notes);
-
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].kind, DiagnosticKind::NonLeafRef);
-        assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Error);
-        assert!(diagnostics[0].location.is_some());
-    }
-
     #[tokio::test]
     async fn collect_diagnostics_loads_rule_file_and_reports_cycle_locations() {
         let suffix = std::time::SystemTime::now()
@@ -688,45 +672,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_diagnostics_loads_rule_file_and_reports_non_leaf_ref_locations() {
-        let suffix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("zk_reconcile_diag_non_leaf_{suffix}"));
-        let note_dir = root.join("note");
-        std::fs::create_dir_all(&note_dir).expect("create note dir");
-
-        let note = note_dir.join("1111111111.typ");
-        std::fs::write(
-            &note,
-            make_toml_note(
-                "A",
-                "1111111111",
-                "none",
-                "- [ ] @2222222222\n  - [ ] child\n",
-            ),
-        )
-        .expect("write note");
-
-        let config = make_test_config(root.clone());
-        let diagnostics = collect_diagnostics(&config, None)
-            .await
-            .expect("collect diagnostics");
-
-        assert!(diagnostics.iter().any(|diag| {
-            diag.kind == DiagnosticKind::NonLeafRef
-                && diag
-                    .location
-                    .as_ref()
-                    .map(|loc| loc.file_path == note)
-                    .unwrap_or(false)
-        }));
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
     async fn run_reconcile_returns_typst_style_cycle_errors_for_all_nodes() {
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -758,42 +703,6 @@ mod tests {
         assert!(rendered.contains("error: Cyclic task dependency"));
         assert!(rendered.contains(&note_a.display().to_string()));
         assert!(rendered.contains(&note_b.display().to_string()));
-        assert!(rendered.contains("┌─"));
-        assert!(rendered.contains("^"));
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn run_reconcile_returns_typst_style_non_leaf_ref_errors() {
-        let suffix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("zk_reconcile_cli_non_leaf_{suffix}"));
-        let note_dir = root.join("note");
-        std::fs::create_dir_all(&note_dir).expect("create note dir");
-
-        let note = note_dir.join("1111111111.typ");
-        std::fs::write(
-            &note,
-            make_toml_note(
-                "A",
-                "1111111111",
-                "none",
-                "- [ ] @2222222222\n  - [ ] child\n",
-            ),
-        )
-        .expect("write note");
-
-        let config = make_test_config(root.clone());
-        let err = run_reconcile(&config, true)
-            .await
-            .expect_err("non-leaf ref should fail");
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("error: Ref item has child items"));
-        assert!(rendered.contains(&note.display().to_string()));
         assert!(rendered.contains("┌─"));
         assert!(rendered.contains("^"));
 

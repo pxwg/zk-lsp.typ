@@ -181,7 +181,6 @@ impl fmt::Display for EvalError {
 pub enum DiagnosticKind {
     Cycle,
     EvalFallback,
-    NonLeafRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

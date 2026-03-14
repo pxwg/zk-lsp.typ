@@ -261,6 +261,7 @@ fn infer_type(expr: &Expr, env: &TypeEnv<'_>) -> Result<Type, TypeError> {
             }
         }
         Expr::Targets(_c) => Ok(Type::List(Box::new(Type::NoteRef))),
+        Expr::Children(_c) => Ok(Type::List(Box::new(Type::CheckboxRef))),
         Expr::LocalCheckboxes(_n) => Ok(Type::List(Box::new(Type::CheckboxRef))),
         Expr::If { cond, then, else_ } => {
             let cond_ty = infer_type(cond, env)?;
@@ -538,6 +539,19 @@ mod tests {
           (define (get_checked c) (observe_checked c))
           (define (test_rule cs)
             (aggregate_status (map get_checked cs))))
+        "#;
+        let module = parse(src);
+        type_check_module(&module).expect("should typecheck");
+    }
+
+    #[test]
+    fn children_returns_checkbox_list() {
+        let src = r#"
+        (module
+          (define (children_done c)
+            (map effective_checked (children c)))
+          (define (effective_checked c)
+            (observe_checked c)))
         "#;
         let module = parse(src);
         type_check_module(&module).expect("should typecheck");

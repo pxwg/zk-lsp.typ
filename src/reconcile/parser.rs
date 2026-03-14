@@ -405,6 +405,11 @@ fn parse_expr(p: &mut Parser) -> Result<Expr, ParseError> {
                     p.expect_rparen()?;
                     Expr::Targets(Box::new(arg))
                 }
+                "children" => {
+                    let arg = parse_expr(p)?;
+                    p.expect_rparen()?;
+                    Expr::Children(Box::new(arg))
+                }
                 "local_checkboxes" => {
                     let arg = parse_expr(p)?;
                     p.expect_rparen()?;
@@ -446,8 +451,10 @@ mod tests {
     #[test]
     fn valid_default_module() {
         let module = parse_module(DEFAULT_MODULE).expect("default module must parse");
-        assert_eq!(module.rules.len(), 3, "expected 3 rules in default module");
+        assert_eq!(module.rules.len(), 5, "expected 5 rules in default module");
         assert!(module.rules.iter().any(|r| r.name == "effective_checked"));
+        assert!(module.rules.iter().any(|r| r.name == "self_truth"));
+        assert!(module.rules.iter().any(|r| r.name == "children_truth"));
         assert!(module.rules.iter().any(|r| r.name == "effective_meta"));
     }
 
@@ -530,5 +537,22 @@ mod tests {
         "#;
         let module = parse_module(src).expect("should parse");
         assert_eq!(module.rules[0].params, vec!["n", "field"]);
+    }
+
+    #[test]
+    fn children_expr_parses() {
+        let src = r#"
+        (module
+          (define (direct_children c)
+            (children c)))
+        "#;
+        let module = parse_module(src).expect("should parse");
+        match &module.rules[0].body {
+            Expr::Children(inner) => match inner.as_ref() {
+                Expr::Var(name) => assert_eq!(name, "c"),
+                other => panic!("expected var, got {other:?}"),
+            },
+            other => panic!("expected children expr, got {other:?}"),
+        }
     }
 }

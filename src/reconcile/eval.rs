@@ -193,6 +193,15 @@ impl<'a> Evaluator<'a> {
                     .collect();
                 Ok(Value::List(list))
             }
+            Expr::Children(c_expr) => {
+                let cid = self.eval_as_checkbox_id(c_expr, env)?;
+                let children = self.snapshot.children(&cid);
+                let list: Vec<Value> = children
+                    .iter()
+                    .map(|child| Value::CheckboxRef(child.clone()))
+                    .collect();
+                Ok(Value::List(list))
+            }
             Expr::LocalCheckboxes(n_expr) => {
                 let note_id = self.eval_as_note_id(n_expr, env)?;
                 let cids = self.snapshot.local_checkboxes(&note_id);
@@ -595,6 +604,33 @@ mod tests {
     }
 
     #[test]
+    fn children_expr_returns_direct_children() {
+        let content = make_toml_note(
+            "A",
+            "1111111111",
+            "none",
+            "- [ ] parent\n  - [x] child\n    - [x] grandchild\n",
+        );
+        let snap = snapshot_from(&[("1111111111", &content)]);
+        let module = default_module();
+        let mut evaluator = Evaluator::new(&module, &snap);
+        let checkboxes = snap.local_checkboxes(&"1111111111".to_string());
+        let env = HashMap::from([("c".to_string(), Value::CheckboxRef(checkboxes[0].clone()))]);
+
+        let result = evaluator
+            .eval_expr(&Expr::Children(Box::new(Expr::Var("c".to_string()))), &env)
+            .expect("eval children");
+
+        match result {
+            Value::List(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0], Value::CheckboxRef(checkboxes[1].clone()));
+            }
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn ref_checkbox_target_done() {
         // A has single ref checkbox pointing at B (done) → A's status becomes Done
         let note_b = make_toml_note("B", "2222222222", "done", "");
@@ -621,6 +657,41 @@ mod tests {
             result.effective_status.get("1111111111"),
             Some(&Status::Done),
             "A should not be Done when its ref target is not done"
+        );
+    }
+
+    #[test]
+    fn parent_ref_done_but_child_incomplete_is_not_done() {
+        let note_b = make_toml_note("B", "2222222222", "done", "");
+        let note_a = make_toml_note(
+            "A",
+            "1111111111",
+            "none",
+            "- [ ] @2222222222\n  - [ ] child\n",
+        );
+        let snap = snapshot_from(&[("1111111111", &note_a), ("2222222222", &note_b)]);
+        let module = default_module();
+        let result = eval_all(&module, &snap);
+        assert_ne!(
+            result.effective_status.get("1111111111"),
+            Some(&Status::Done)
+        );
+    }
+
+    #[test]
+    fn local_non_leaf_parent_ignores_own_checkbox_when_children_done() {
+        let content = make_toml_note(
+            "A",
+            "1111111111",
+            "none",
+            "- [ ] parent\n  - [x] child1\n  - [x] child2\n",
+        );
+        let snap = snapshot_from(&[("1111111111", &content)]);
+        let module = default_module();
+        let result = eval_all(&module, &snap);
+        assert_eq!(
+            result.effective_status.get("1111111111"),
+            Some(&Status::Done)
         );
     }
 
@@ -768,9 +839,17 @@ mod tests {
             (unknown-status none)
             (unknown-checked false))
           (define (effective_checked c)
+            (and (self_truth c) (children_truth c)))
+          (define (self_truth c)
             (if (empty? (targets c))
-                (observe_checked c)
+                (if (empty? (children c))
+                    (observe_checked c)
+                    true)
                 (all_done (map target_status (targets c)))))
+          (define (children_truth c)
+            (if (empty? (children c))
+                true
+                (eq? (aggregate_status (map effective_checked (children c))) done)))
           (define (target_status n)
             (effective_meta n "checklist-status"))
           (define (effective_meta n field)

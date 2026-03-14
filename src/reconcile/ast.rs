@@ -52,6 +52,8 @@ pub enum Expr {
     ObserveMeta(Box<Expr>, Box<Expr>),
     /// `(targets <checkbox_expr>)`
     Targets(Box<Expr>),
+    /// `(children <checkbox_expr>)`
+    Children(Box<Expr>),
     /// `(local_checkboxes <note_expr>)`
     LocalCheckboxes(Box<Expr>),
     /// `(if <cond> <then> <else>)`

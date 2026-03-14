@@ -37,8 +37,10 @@ pub struct WorkspaceSnapshot {
     pub notes: HashMap<NoteId, NoteObs>,
     /// Checkbox id → CheckboxObs
     pub checkboxes: HashMap<CheckboxId, CheckboxObs>,
-    /// Note id → leaf checkbox IDs (for effective_status eval)
-    pub note_leaf_checkboxes: HashMap<NoteId, Vec<CheckboxId>>,
+    /// Note id → all checklist IDs in source order.
+    pub note_checkboxes: HashMap<NoteId, Vec<CheckboxId>>,
+    /// Checkbox id → direct child checkbox IDs in source order.
+    pub checkbox_children: HashMap<CheckboxId, Vec<CheckboxId>>,
     /// Config-driven default values for known metadata fields.
     pub metadata_defaults: HashMap<String, Value>,
 }
@@ -98,10 +100,17 @@ impl WorkspaceSnapshot {
             .unwrap_or(&[])
     }
 
-    /// Leaf checkboxes only (used by `effective_status` evaluation).
+    /// All checklist items in source order.
     pub fn local_checkboxes(&self, note_id: &NoteId) -> &[CheckboxId] {
-        self.note_leaf_checkboxes
+        self.note_checkboxes
             .get(note_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn children(&self, checkbox_id: &CheckboxId) -> &[CheckboxId] {
+        self.checkbox_children
+            .get(checkbox_id)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
@@ -131,7 +140,8 @@ impl WorkspaceSnapshot {
     ) -> Self {
         let mut note_obs_map: HashMap<NoteId, NoteObs> = HashMap::new();
         let mut checkboxes: HashMap<CheckboxId, CheckboxObs> = HashMap::new();
-        let mut note_leaf_checkboxes: HashMap<NoteId, Vec<CheckboxId>> = HashMap::new();
+        let mut note_checkboxes: HashMap<NoteId, Vec<CheckboxId>> = HashMap::new();
+        let mut checkbox_children: HashMap<CheckboxId, Vec<CheckboxId>> = HashMap::new();
         let metadata_kinds = metadata_kind_map(metadata_fields);
         let metadata_defaults = metadata_default_map(metadata_fields);
 
@@ -164,22 +174,15 @@ impl WorkspaceSnapshot {
                 },
             );
 
-            // Parse checklist items — classify leaves
+            // Parse checklist items.
             let items = parser::parse_checklist_items(content);
-            let total = items.len();
-            let mut leaf_ids: Vec<CheckboxId> = Vec::new();
+            let mut checkbox_ids: Vec<CheckboxId> = Vec::new();
+            let mut stack: Vec<(usize, CheckboxId)> = Vec::new();
 
-            for (i, item) in items.iter().enumerate() {
+            for item in &items {
                 let cid = CheckboxId {
                     note_id: id.clone(),
                     line_idx: item.line_idx,
-                };
-
-                // Leaf: next item has indent <= this item, or this is the last item
-                let is_leaf = if i + 1 >= total {
-                    true
-                } else {
-                    items[i + 1].indent <= item.indent
                 };
 
                 let (checked, targets) = match &item.kind {
@@ -192,18 +195,31 @@ impl WorkspaceSnapshot {
                 };
 
                 checkboxes.insert(cid.clone(), CheckboxObs { checked, targets });
-                if is_leaf {
-                    leaf_ids.push(cid);
+                while stack
+                    .last()
+                    .is_some_and(|(indent, _)| *indent >= item.indent)
+                {
+                    stack.pop();
                 }
+                if let Some((_, parent_id)) = stack.last() {
+                    checkbox_children
+                        .entry(parent_id.clone())
+                        .or_default()
+                        .push(cid.clone());
+                }
+                checkbox_children.entry(cid.clone()).or_default();
+                stack.push((item.indent, cid.clone()));
+                checkbox_ids.push(cid);
             }
 
-            note_leaf_checkboxes.insert(id.clone(), leaf_ids);
+            note_checkboxes.insert(id.clone(), checkbox_ids);
         }
 
         WorkspaceSnapshot {
             notes: note_obs_map,
             checkboxes,
-            note_leaf_checkboxes,
+            note_checkboxes,
+            checkbox_children,
             metadata_defaults,
         }
     }
@@ -455,18 +471,47 @@ mod tests {
     }
 
     #[test]
-    fn leaf_only_local_checkboxes() {
-        // parent has children; only children are leaves
+    fn local_checkboxes_include_parent_and_children() {
         let body = "- [ ] parent\n  - [x] child1\n  - [x] child2\n";
         let content = make_toml_note("A", "1111111111", "none", body);
         let snap = single_note_snapshot("1111111111", &content);
 
-        let leaves = snap.local_checkboxes(&"1111111111".to_string());
-        // 3 items total: parent (non-leaf), child1 (leaf), child2 (leaf)
-        assert_eq!(leaves.len(), 2, "only leaves");
-        for leaf in leaves {
-            assert_ne!(leaf.line_idx, 0, "parent line should not be a leaf (it's on line with import/title, actual body starts further)");
-        }
+        let checkboxes = snap.local_checkboxes(&"1111111111".to_string());
+        assert_eq!(checkboxes.len(), 3);
+        assert!(checkboxes[0].line_idx < checkboxes[1].line_idx);
+        assert!(checkboxes[1].line_idx < checkboxes[2].line_idx);
+    }
+
+    #[test]
+    fn children_returns_direct_children_only() {
+        let body = "- [ ] parent\n  - [x] child1\n    - [x] grandchild\n  - [ ] child2\n";
+        let content = make_toml_note("A", "1111111111", "none", body);
+        let snap = single_note_snapshot("1111111111", &content);
+
+        let checkboxes = snap.local_checkboxes(&"1111111111".to_string());
+        let parent_children = snap.children(&checkboxes[0]);
+        assert_eq!(parent_children.len(), 2);
+        assert_eq!(parent_children[0].line_idx, checkboxes[1].line_idx);
+        assert_eq!(parent_children[1].line_idx, checkboxes[3].line_idx);
+
+        let child_children = snap.children(&checkboxes[1]);
+        assert_eq!(child_children.len(), 1);
+        assert_eq!(child_children[0].line_idx, checkboxes[2].line_idx);
+    }
+
+    #[test]
+    fn children_respects_sibling_boundaries() {
+        let body = "- [ ] a\n  - [x] a1\n- [ ] b\n  - [x] b1\n";
+        let content = make_toml_note("A", "1111111111", "none", body);
+        let snap = single_note_snapshot("1111111111", &content);
+
+        let checkboxes = snap.local_checkboxes(&"1111111111".to_string());
+        let a_children = snap.children(&checkboxes[0]);
+        let b_children = snap.children(&checkboxes[2]);
+        assert_eq!(a_children.len(), 1);
+        assert_eq!(b_children.len(), 1);
+        assert_eq!(a_children[0].line_idx, checkboxes[1].line_idx);
+        assert_eq!(b_children[0].line_idx, checkboxes[3].line_idx);
     }
 
     #[test]
@@ -475,9 +520,9 @@ mod tests {
         let content = make_toml_note("A", "1111111111", "none", body);
         let snap = single_note_snapshot("1111111111", &content);
 
-        let leaves = snap.local_checkboxes(&"1111111111".to_string());
-        assert_eq!(leaves.len(), 1);
-        let targets = snap.targets(&leaves[0]);
+        let checkboxes = snap.local_checkboxes(&"1111111111".to_string());
+        assert_eq!(checkboxes.len(), 1);
+        let targets = snap.targets(&checkboxes[0]);
         assert_eq!(targets, &["2222222222".to_string()]);
     }
 
@@ -487,9 +532,9 @@ mod tests {
         let content = make_toml_note("A", "1111111111", "none", body);
         let snap = single_note_snapshot("1111111111", &content);
 
-        let leaves = snap.local_checkboxes(&"1111111111".to_string());
-        assert_eq!(leaves.len(), 1);
-        let targets = snap.targets(&leaves[0]);
+        let checkboxes = snap.local_checkboxes(&"1111111111".to_string());
+        assert_eq!(checkboxes.len(), 1);
+        let targets = snap.targets(&checkboxes[0]);
         assert!(targets.is_empty(), "local item has no targets");
     }
 
