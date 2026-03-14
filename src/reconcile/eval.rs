@@ -18,24 +18,24 @@ pub struct EvalResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CallKey {
-    name: String,
-    args: Vec<Value>,
+    name: Rc<str>,
+    args: Rc<[Value]>,
 }
 
 struct EnvFrame<'a> {
-    bindings: HashMap<String, Value>,
+    bindings: Vec<(&'a str, Value)>,
     parent: Option<&'a EnvFrame<'a>>,
 }
 
 impl<'a> EnvFrame<'a> {
     fn empty() -> Self {
         Self {
-            bindings: HashMap::new(),
+            bindings: Vec::new(),
             parent: None,
         }
     }
 
-    fn child(parent: &'a EnvFrame<'a>, bindings: HashMap<String, Value>) -> Self {
+    fn child(parent: &'a EnvFrame<'a>, bindings: Vec<(&'a str, Value)>) -> Self {
         Self {
             bindings,
             parent: Some(parent),
@@ -44,13 +44,16 @@ impl<'a> EnvFrame<'a> {
 
     fn get(&self, name: &str) -> Option<&Value> {
         self.bindings
-            .get(name)
+            .iter()
+            .find(|(binding_name, _)| *binding_name == name)
+            .map(|(_, value)| value)
             .or_else(|| self.parent.and_then(|parent| parent.get(name)))
     }
 }
 
 struct Evaluator<'a> {
     module: &'a Module,
+    rule_index: HashMap<&'a str, &'a Rule>,
     snapshot: &'a WorkspaceSnapshot,
     type_info: &'a TypeInfo,
     call_cache: HashMap<CallKey, Value>,
@@ -62,6 +65,11 @@ impl<'a> Evaluator<'a> {
     fn new(module: &'a Module, snapshot: &'a WorkspaceSnapshot, type_info: &'a TypeInfo) -> Self {
         Self {
             module,
+            rule_index: module
+                .rules
+                .iter()
+                .map(|rule| (rule.name.as_str(), rule))
+                .collect(),
             snapshot,
             type_info,
             call_cache: HashMap::new(),
@@ -170,9 +178,10 @@ impl<'a> Evaluator<'a> {
     }
 
     fn invoke_function(&mut self, name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
+        let args: Rc<[Value]> = args.into();
         let key = CallKey {
-            name: name.to_string(),
-            args: args.clone(),
+            name: Rc::from(name),
+            args: Rc::clone(&args),
         };
 
         if let Some(cached) = self.call_cache.get(&key) {
@@ -180,15 +189,15 @@ impl<'a> Evaluator<'a> {
         }
 
         if self.call_stack.contains(&key) {
-            let fallback = self.cycle_fallback(name, &args);
+            let fallback = self.cycle_fallback(name, args.as_ref());
             return Ok(fallback);
         }
 
         self.call_stack.push(key.clone());
-        let result = if let Some(rule) = self.module.rules.iter().find(|rule| rule.name == name) {
-            self.eval_rule(rule, &args)
+        let result = if let Some(rule) = self.rule_index.get(name) {
+            self.eval_rule(rule, args.as_ref())
         } else {
-            self.eval_builtin(name, &args)
+            self.eval_builtin(name, args.as_ref())
         };
         self.call_stack.pop();
 
@@ -200,9 +209,9 @@ impl<'a> Evaluator<'a> {
     }
 
     fn eval_rule(&mut self, rule: &Rule, args: &[Value]) -> Result<Value, EvalError> {
-        let mut bindings = HashMap::new();
+        let mut bindings = Vec::with_capacity(rule.params.len());
         for (param, arg) in rule.params.iter().zip(args.iter()) {
-            bindings.insert(param.clone(), arg.clone());
+            bindings.push((param.as_str(), arg.clone()));
         }
         let root = EnvFrame::empty();
         let env = EnvFrame::child(&root, bindings);
@@ -244,7 +253,6 @@ impl<'a> Evaluator<'a> {
                     context: "aggregate_status".to_string(),
                 }),
             },
-            "list" => Ok(Value::List(Rc::new(args.to_vec()))),
             "eq?" => match args {
                 [left, right] => Ok(Value::Bool(left == right)),
                 _ => Err(EvalError::TypeMismatch {
@@ -472,7 +480,7 @@ pub fn eval_all_typed(
         .call_cache
         .iter()
         .filter_map(|(key, value)| {
-            if key.name == "effective_meta" && key.args.len() == 2 {
+            if key.name.as_ref() == "effective_meta" && key.args.len() == 2 {
                 match (&key.args[0], &key.args[1]) {
                     (Value::NoteRef(note_id), Value::String(field)) => {
                         Some(((note_id.clone(), field.to_string()), value.clone()))
@@ -489,7 +497,7 @@ pub fn eval_all_typed(
         .call_cache
         .iter()
         .filter_map(|(key, value)| {
-            if key.name == "effective_checked" && key.args.len() == 1 {
+            if key.name.as_ref() == "effective_checked" && key.args.len() == 1 {
                 match (&key.args[0], value) {
                     (Value::CheckboxRef(cid), Value::Status(status)) => {
                         Some((cid.clone(), status.clone()))
