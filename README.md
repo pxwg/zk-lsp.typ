@@ -325,16 +325,92 @@ The built-in tree primitive semantics are:
 - `local_checkboxes(n)`: all checklist items in note `n`, preserving source order
 - `children(c)`: direct children of checkbox `c` in the same note, preserving source order
 
-The built-in status/value semantics are:
-
-- `observe_checked(c)`: returns a `Status` (`done`/`todo`) rather than a boolean
-- `observe_meta(n, field)`: reads typed core/configured metadata fields and otherwise falls back to `String`, so arbitrary flattened TOML leaf keys remain readable
-- `aggregate_status(xs)`: accepts `List(Status)` and returns a `Status`
-- `list(x...)`: constructs a `List` value, typically for `materialized_fields`
-- `empty?`, `all_done`, `eq?`, `not`, `and`, `or`, `done?`, `todo?`, `wip?`, `none?`: return `Bool` for control flow
-- checklist rules should compute in `Status`; `Bool` is reserved for predicates and `if`
-
 `children(c)` uses the parsed checklist tree: items after `c` with deeper indentation, stopping at the first checklist item whose indentation is less than or equal to `c`; only the next indentation layer counts as direct children.
+
+### Value types
+
+| Type | Description |
+|------|-------------|
+| `Bool` | `true` / `false`; produced by predicates and comparisons |
+| `Status` | `none` / `todo` / `wip` / `done` |
+| `Int` | 64-bit signed integer; written as decimal literals (`0`, `42`, `-7`) |
+| `Nil` | Absence value; returned by `parent` for root items |
+| `String` | Arbitrary string; metadata fields not typed as Status/Bool/List fall back to this |
+| `List(T)` | Homogeneous list; constructed by `list`, `map`, `filter`, `backlinks`, etc. |
+| `NoteRef` | Runtime handle to a note |
+| `CheckboxRef` | Runtime handle to a single checklist item |
+
+### Builtin standard library
+
+**Observations** (read workspace state):
+
+| Builtin | Signature | Description |
+|---------|-----------|-------------|
+| `observe_checked(c)` | `CheckboxRef → Status` | Raw checkbox state (`done`/`todo`) |
+| `observe_meta(n, field)` | `NoteRef × String → T` | Read a metadata field; type follows configured field kind |
+| `targets(c)` | `CheckboxRef → List(NoteRef)` | Ref-item target note IDs (`@ID` tokens) |
+| `backlinks(n)` | `NoteRef → List(NoteRef)` | Notes that reference `n` via a `@ID` ref item, sorted and deduped |
+| `parent(c)` | `CheckboxRef → CheckboxRef\|Nil` | Parent checkbox in the indent tree, or `Nil` for root items |
+| `owner_note(c)` | `CheckboxRef → NoteRef` | Note that contains checkbox `c` |
+| `local_checkboxes(n)` | `NoteRef → List(CheckboxRef)` | All checklist items in note `n` |
+| `children(c)` | `CheckboxRef → List(CheckboxRef)` | Direct child checkboxes |
+
+**Status operations**:
+
+| Builtin | Signature | Description |
+|---------|-----------|-------------|
+| `aggregate_status(xs)` | `List(Status) → Status` | `Done` if all done; `Todo` if all todo; `Wip` otherwise; `None` if empty |
+| `done?` / `todo?` / `wip?` / `none?` | `Status → Bool` | Status predicates |
+| `all_done(xs)` / `all_done?` | `List(Status) → Bool` | True iff all items are `Done` |
+
+**Boolean operations**:
+
+| Builtin | Signature | Description |
+|---------|-----------|-------------|
+| `not(b)` | `Bool → Bool` | Logical negation |
+| `and(b...)` / `or(b...)` | `Bool... → Bool` | Short-circuit logical connectives |
+| `eq?(a, b)` | `T × T → Bool` | Structural equality |
+| `nil?(v)` | `Any → Bool` | True iff `v` is `Nil` |
+
+**Arithmetic**:
+
+| Builtin | Signature | Description |
+|---------|-----------|-------------|
+| `+` / `-` | `Int × Int → Int` | Addition / subtraction |
+| `<` / `>` / `<=` / `>=` | `Int × Int → Bool` | Integer comparisons |
+
+**List operations**:
+
+| Builtin | Signature | Description |
+|---------|-----------|-------------|
+| `list(x...)` | `T... → List(T)` | Construct a list literal |
+| `map(f, xs)` | `(T→U) × List(T) → List(U)` | Apply `f` to each element |
+| `filter(f, xs)` | `(T→Bool) × List(T) → List(T)` | Keep elements where `f` returns `true` |
+| `reduce(f, init, xs)` | `(A×B→A) × A × List(B) → A` | Fold `xs` with `f`; `f` must be a 2-param rule or `+`/`-` |
+| `length(xs)` | `List(T) → Int` | Number of elements |
+| `empty?(xs)` | `List(T) → Bool` | True iff list is empty |
+| `union(xs, ys)` | `List(T) × List(T) → List(T)` | Append elements of `ys` not already in `xs` |
+| `contains?(xs, v)` | `List(T) × T → Bool` | True iff `v` is in `xs` |
+| `dedup(xs)` | `List(T) → List(T)` | Remove duplicate elements, preserving first occurrence |
+
+**Higher-order forms** — `map`, `filter`, and `reduce` take a *function symbol* (not a value), so the function name is written unquoted: `(map done? statuses)`, `(filter is_done notes)`, `(reduce + 0 counts)`. Only 1-arg functions may be passed to `map`/`filter`; `reduce` requires a 2-arg function or `+`/`-`.
+
+### Example: backlink-verified rule
+
+`examples/rules/backlink_verified.lisp` shows how to materialize a custom `user.verified` field using the graph-query builtins: a note is verified when at least three *done* notes reference it.
+
+```lisp
+(define (done_backlink_count n)
+  (length (filter is_done_note (backlinks n))))
+
+(define (is_done_note n)
+  (done? (observe_meta n "checklist-status")))
+
+(define (effective_meta n field)
+  (if (eq? field "user.verified")
+      (if (>= (done_backlink_count n) 3) "true" "false")
+      (observe_meta n field)))
+```
 
 ### Merge semantics
 
