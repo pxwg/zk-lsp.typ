@@ -4,6 +4,10 @@ version = "0.4.0"
 edition = "2021"
 license = "AGPL-3.0"
 
+[lib]
+name = "zk_lsp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "zk-lsp"
 path = "src/main.rs"

@@ -1,13 +1,28 @@
+//! Core types for the Reconcile DSL v1.
+//!
+//! The DSL implements the observe → effective → materialize model described
+//! in the [Reconcile DSL guide](https://docs.rs/zk-lsp/latest/zk_lsp/reconcile_dsl/).
+//!
+//! At evaluation time, the engine:
+//! 1. Builds a workspace snapshot (notes, checkboxes, typed metadata)
+//! 2. Loads and merges DSL modules from disk
+//! 3. Type-checks the merged module against the builtin surface
+//! 4. Evaluates `effective_checked` / `effective_meta` in topological order
+//! 5. Writes back fields declared by `materialized_fields`
+
 use std::fmt;
-/// Core types for the Reconcile DSL v1.
 use std::path::PathBuf;
 use std::rc::Rc;
 
+/// 10-digit string note identifier (`YYMMDDHHMM`).
 pub type NoteId = String;
 
+/// Stable identifier for a checklist item: note ID plus 0-based line index.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CheckboxId {
+    /// Note that contains this checklist item.
     pub note_id: NoteId,
+    /// 0-based line index within the note content.
     pub line_idx: usize,
 }
 
@@ -17,11 +32,18 @@ impl fmt::Display for CheckboxId {
     }
 }
 
+/// Note / checklist status values used throughout the DSL.
+///
+/// Maps to the `checklist-status` TOML field and to the `Status` DSL type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Status {
+    /// No checklist — status not applicable.
     None,
+    /// At least one item incomplete, none in progress.
     Todo,
+    /// Mixed: some done, some not.
     Wip,
+    /// All leaf items complete.
     Done,
 }
 
@@ -47,18 +69,28 @@ impl fmt::Display for Status {
     }
 }
 
+/// Runtime value in the Reconcile DSL evaluator.
+///
+/// The type system is checked statically before evaluation; these variants
+/// are the concrete runtime representations.  Users never interact with
+/// `Value` directly — it is the evaluator's internal currency.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
+    /// Logical `true` / `false`.
     Bool(bool),
+    /// 64-bit signed integer.
     Int(i64),
+    /// Absence value; returned by `parent` for root checklist items.
     Nil,
+    /// One of `none` / `todo` / `wip` / `done`.
     Status(Status),
+    /// Homogeneous list; shared via reference-counting.
     List(Rc<Vec<Value>>),
-    /// Runtime-only: a reference to a note (used inside the evaluator).
+    /// Runtime handle to a note (evaluator-internal).
     NoteRef(NoteId),
-    /// Runtime-only: a reference to a checkbox (used inside the evaluator).
+    /// Runtime handle to a checklist item (evaluator-internal).
     CheckboxRef(CheckboxId),
-    /// Runtime-only: a string value (e.g., from `observe_meta` for non-status fields).
+    /// String value returned by `observe_meta` for non-Status metadata fields.
     String(Rc<str>),
 }
 

@@ -1,3 +1,15 @@
+//! Configuration loading for `zk-lsp`.
+//!
+//! Configuration is merged from two files in order (project overrides user):
+//!
+//! | Path | Scope |
+//! |------|-------|
+//! | `$XDG_CONFIG_HOME/zk-lsp/config.toml` | User-level |
+//! | `<wiki-root>/zk-lsp.toml` | Project-level |
+//!
+//! See [`ZkLspConfig`] for the full list of recognised keys and
+//! [`WikiConfig`] for runtime path resolution.
+
 use std::path::{Path, PathBuf};
 
 use tower_lsp::lsp_types::{InitializeParams, Url};
@@ -14,23 +26,46 @@ const CORE_METADATA_FIELDS: &[&str] = &[
     "relation-target",
 ];
 
+/// The data type of a user-defined metadata field.
+///
+/// Declared via the `kind` key in `[[metadata.field]]` config entries.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetadataFieldKind {
+    /// TOML `string` — written as a quoted value.
     String,
+    /// TOML `boolean` — `true` or `false`.
     Boolean,
+    /// TOML array of strings — `["a", "b"]`.
     ArrayString,
 }
 
+/// A single user-defined metadata field declaration.
+///
+/// Declared in config as:
+/// ```toml
+/// [[metadata.field]]
+/// path    = "user.priority"
+/// kind    = "string"
+/// default = "normal"
+/// ```
+///
+/// The `path` must be in the `user.*` namespace (exactly one dot, non-empty
+/// sub-key).  Core fields such as `checklist-status` cannot be redeclared.
 #[derive(Debug, Clone)]
 pub struct MetadataFieldConfig {
-    pub path: String, // e.g., "user.course"
+    /// Field path, e.g. `"user.course"`.
+    pub path: String,
     #[allow(dead_code)]
+    /// Value type of this field.
     pub kind: MetadataFieldKind,
+    /// Default value inserted into new notes created by `zk-lsp new`.
     pub default: toml::Value,
 }
 
+/// Aggregated user-defined metadata field declarations.
 #[derive(Debug, Clone, Default)]
 pub struct MetadataConfig {
+    /// All declared custom fields, in declaration order.
     pub fields: Vec<MetadataFieldConfig>,
 }
 
@@ -144,19 +179,32 @@ fn merge_metadata(mut user: MetadataConfig, project: MetadataConfig) -> Metadata
     user
 }
 
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
+/// Resolve a path string from a config file.
+///
+/// Resolution order:
+/// 1. `~/…` — expanded relative to `$HOME`
+/// 2. Absolute path — used as-is
+/// 3. Relative path — resolved relative to `base_dir` (the directory that
+///    contains the config file), so `./rules/foo.lisp` in
+///    `<wiki-root>/zk-lsp.toml` resolves to `<wiki-root>/rules/foo.lisp`
+fn resolve_config_path(path_str: &str, base_dir: &Path) -> PathBuf {
+    if let Some(rest) = path_str.strip_prefix("~/") {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         PathBuf::from(home).join(rest)
-    } else if path == "~" {
+    } else if path_str == "~" {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         PathBuf::from(home)
     } else {
-        PathBuf::from(path)
+        let p = PathBuf::from(path_str);
+        if p.is_absolute() {
+            p
+        } else {
+            base_dir.join(p)
+        }
     }
 }
 
-fn parse_hooks_config(table: &toml::Table) -> Vec<PathBuf> {
+fn parse_hooks_config(table: &toml::Table, base_dir: &Path) -> Vec<PathBuf> {
     let hooks_arr = match table.get("hook").and_then(|v| v.as_array()) {
         Some(a) => a.clone(),
         None => return Vec::new(),
@@ -175,12 +223,12 @@ fn parse_hooks_config(table: &toml::Table) -> Vec<PathBuf> {
                 continue;
             }
         };
-        hooks.push(expand_tilde(path_str));
+        hooks.push(resolve_config_path(path_str, base_dir));
     }
     hooks
 }
 
-fn parse_reconcile_rules_config(table: &toml::Table) -> Vec<PathBuf> {
+fn parse_reconcile_rules_config(table: &toml::Table, base_dir: &Path) -> Vec<PathBuf> {
     let rules_arr = match table
         .get("reconcile")
         .and_then(|v| v.get("rule"))
@@ -203,29 +251,64 @@ fn parse_reconcile_rules_config(table: &toml::Table) -> Vec<PathBuf> {
                 continue;
             }
         };
-        rules.push(expand_tilde(path_str));
+        rules.push(resolve_config_path(path_str, base_dir));
     }
     rules
 }
 
-/// Merged zk-lsp configuration.
+/// Merged `zk-lsp` configuration.
 ///
-/// Load order (later overrides earlier):
-/// 1. `$XDG_CONFIG_HOME/zk-lsp/config.toml`  (user-level)
-/// 2. `<wiki-root>/zk-lsp.toml`               (project-level)
+/// Produced by [`ZkLspConfig::load`], which reads and merges user-level and
+/// project-level TOML files.  Project values override user values; hook and
+/// rule lists are **concatenated** (user first, then project).
+///
+/// # Load order
+///
+/// 1. `$XDG_CONFIG_HOME/zk-lsp/config.toml` — user-level
+/// 2. `<wiki-root>/zk-lsp.toml` — project-level (overrides user)
+///
+/// # Recognised TOML keys
+///
+/// ```toml
+/// # New-note template
+/// [new_note]
+/// template = "…"          # Supports {{id}} and {{metadata}} placeholders
+///
+/// # Custom metadata fields
+/// [metadata]
+/// version = 1
+/// [[metadata.field]]
+/// path    = "user.priority"
+/// kind    = "string"       # "string" | "boolean" | "array-string"
+/// default = "normal"
+///
+/// # Lua format hooks
+/// disable_default_hooks = false
+/// [[hook]]
+/// path = "~/.config/zk-lsp/hooks/my_hook.lua"
+///
+/// # Reconcile DSL rule files
+/// disable_default_reconcile_rules = false
+/// [[reconcile.rule]]
+/// path = "./reconcile/project_rules.lisp"
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct ZkLspConfig {
-    /// Custom template for `zk-lsp new`. Supports `{{id}}` and `{{metadata}}`.
+    /// Custom template for `zk-lsp new`.
+    ///
+    /// Supports two placeholders:
+    /// - `{{id}}` — the 10-digit timestamp ID
+    /// - `{{metadata}}` — the standard TOML metadata block
     pub new_note_template: Option<String>,
     /// User-defined metadata fields added to new notes.
     pub metadata: MetadataConfig,
-    /// Lua hook scripts to run during formatting, in order (after default hooks).
+    /// Lua hook scripts run during `zk-lsp format`, in order (after built-in hooks).
     pub hooks: Vec<PathBuf>,
     /// Reconcile DSL modules loaded at runtime and merged in order.
     pub reconcile_rules: Vec<PathBuf>,
-    /// If true, skip the built-in default hooks (checklist.lua + relation_status.lua).
+    /// When `true`, skip the built-in `checklist.lua` and `relation_status.lua` hooks.
     pub disable_default_hooks: bool,
-    /// If true, do not preload the built-in reconcile DSL module.
+    /// When `true`, do not preload the built-in `examples/rules/checklist.lisp` module.
     pub disable_default_reconcile_rules: bool,
 }
 
@@ -248,6 +331,7 @@ impl ZkLspConfig {
         let Ok(table) = raw.parse::<toml::Table>() else {
             return Self::default();
         };
+        let base_dir = path.parent().unwrap_or(Path::new("."));
         Self {
             new_note_template: table
                 .get("new_note")
@@ -255,8 +339,8 @@ impl ZkLspConfig {
                 .and_then(|v| v.as_str())
                 .map(String::from),
             metadata: parse_metadata_config(&table),
-            hooks: parse_hooks_config(&table),
-            reconcile_rules: parse_reconcile_rules_config(&table),
+            hooks: parse_hooks_config(&table, base_dir),
+            reconcile_rules: parse_reconcile_rules_config(&table, base_dir),
             disable_default_hooks: table
                 .get("disable_default_hooks")
                 .and_then(|v| v.as_bool())
@@ -291,12 +375,27 @@ impl ZkLspConfig {
     }
 }
 
+/// Resolved wiki paths and merged configuration for a single run.
+///
+/// Obtained from [`WikiConfig::resolve`] (CLI / env) or
+/// [`WikiConfig::from_root`] (direct path).
+///
+/// # Root resolution order
+///
+/// 1. `--wiki-root` CLI flag
+/// 2. `WIKI_ROOT` environment variable
+/// 3. LSP `initializationOptions.root_dir` / `rootUri` / `workspaceFolders[0]`
+/// 4. `~/wiki` fallback
 #[derive(Debug, Clone)]
 pub struct WikiConfig {
+    /// Absolute path to the wiki root directory.
     #[allow(dead_code)]
     pub root: PathBuf,
+    /// `<root>/note/` — directory containing all `.typ` note files.
     pub note_dir: PathBuf,
+    /// `<root>/link.typ` — auto-generated include file managed by `zk-lsp generate`.
     pub link_file: PathBuf,
+    /// Merged user + project configuration.
     pub zk_config: ZkLspConfig,
 }
 
@@ -362,11 +461,12 @@ mod tests {
 
     fn parse_config(toml_str: &str) -> ZkLspConfig {
         let table = toml_str.parse::<toml::Table>().unwrap();
+        let base = Path::new(".");
         ZkLspConfig {
             new_note_template: None,
             metadata: parse_metadata_config(&table),
-            hooks: parse_hooks_config(&table),
-            reconcile_rules: parse_reconcile_rules_config(&table),
+            hooks: parse_hooks_config(&table, base),
+            reconcile_rules: parse_reconcile_rules_config(&table, base),
             disable_default_hooks: table
                 .get("disable_default_hooks")
                 .and_then(|v| v.as_bool())
