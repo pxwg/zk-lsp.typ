@@ -61,11 +61,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -74,21 +70,16 @@ jobs:
 
       - name: Build rustdoc
         run: cargo doc --no-deps --document-private-items
-        env:
-          RUSTDOCFLAGS: "--cfg docsrs --html-in-header .github/doc-header.html"
 
       - name: Add redirect index
         run: echo '<meta http-equiv="refresh" content="0; url=zk_lsp/">' > target/doc/index.html
 
-      - uses: actions/configure-pages@v5
-
-      - uses: actions/upload-pages-artifact@v3
+      - name: Deploy to gh-pages branch
+        uses: peaceiris/actions-gh-pages@v4
         with:
-          path: target/doc
-
-      - name: Deploy to GitHub Pages
-        id: deploy
-        uses: actions/deploy-pages@v4
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: target/doc
+          force_orphan: true
 
   release:
     needs: build
