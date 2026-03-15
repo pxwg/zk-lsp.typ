@@ -66,6 +66,8 @@ pub mod dependency_graph;
 #[doc(hidden)]
 pub mod graph_check;
 #[doc(hidden)]
+pub mod handlers;
+#[doc(hidden)]
 pub mod index;
 #[doc(hidden)]
 pub mod init;
@@ -81,8 +83,6 @@ pub mod parser;
 pub mod server;
 #[doc(hidden)]
 pub mod watcher;
-#[doc(hidden)]
-pub mod handlers;
 
 // --- Guide documents embedded via include_str! so they update with the source ---
 

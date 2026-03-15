@@ -3,9 +3,10 @@ use std::path::PathBuf;
 
 use tower_lsp::lsp_types::*;
 
+use crate::config::MetadataFieldConfig;
 use crate::config::WikiConfig;
 use crate::hooks::apply::apply_hook_result;
-use crate::hooks::lua::{build_hook_note_input, HookRunner};
+use crate::hooks::lua::{build_hook_note_input_with_metadata_fields, HookRunner};
 use crate::parser;
 
 /// Default hooks embedded at compile time.
@@ -83,19 +84,19 @@ pub fn apply_metadata_patch(
     content: &str,
     patch: &HashMap<String, toml::Value>,
 ) -> anyhow::Result<String> {
-    let block = parser::find_toml_metadata_block(content)
-        .ok_or_else(|| anyhow::anyhow!("no TOML metadata block found"))?;
-
-    let lines: Vec<&str> = content.lines().collect();
     let trailing_newline = content.ends_with('\n');
-    let mut result_lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    let mut result_lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
 
     'patch: for (key, value) in patch {
+        let (block_start, block_end) = find_metadata_block_line_range(&result_lines)?;
         let val_str = toml_value_inline(value)?;
 
         // Pass 1: dotted-key notation — `user.verified = "false"`
-        for i in block.start_line..=block.end_line {
-            let line = lines[i];
+        for i in block_start..=block_end {
+            let line = result_lines
+                .get(i)
+                .map(String::as_str)
+                .ok_or_else(|| anyhow::anyhow!("metadata block line {i} missing"))?;
             let trimmed = line.trim_start();
             if trimmed.starts_with(&format!("{key} =")) || trimmed.starts_with(&format!("{key}=")) {
                 let indent_len = line.len() - trimmed.len();
@@ -113,8 +114,11 @@ pub fn apply_metadata_patch(
             if !field_name.contains('.') {
                 let section_header = format!("[{table_name}]");
                 let mut in_section = false;
-                for i in block.start_line..=block.end_line {
-                    let line = lines[i];
+                for i in block_start..=block_end {
+                    let line = result_lines
+                        .get(i)
+                        .map(String::as_str)
+                        .ok_or_else(|| anyhow::anyhow!("metadata block line {i} missing"))?;
                     let trimmed = line.trim_start();
                     if trimmed == section_header {
                         in_section = true;
@@ -135,10 +139,20 @@ pub fn apply_metadata_patch(
                         }
                     }
                 }
+
+                insert_missing_section_key(
+                    &mut result_lines,
+                    block_start,
+                    block_end,
+                    table_name,
+                    field_name,
+                    &val_str,
+                )?;
+                continue 'patch;
             }
         }
 
-        anyhow::bail!("key '{key}' not found in TOML metadata block");
+        insert_missing_top_level_key(&mut result_lines, block_start, block_end, key, &val_str)?;
     }
 
     let mut out = result_lines.join("\n");
@@ -146,6 +160,111 @@ pub fn apply_metadata_patch(
         out.push('\n');
     }
     Ok(out)
+}
+
+fn find_metadata_block_line_range(lines: &[String]) -> anyhow::Result<(usize, usize)> {
+    let start = lines
+        .iter()
+        .position(|line| {
+            line.trim().starts_with("#let zk-metadata") && line.contains("toml(bytes(")
+        })
+        .ok_or_else(|| anyhow::anyhow!("no TOML metadata block found"))?;
+
+    let open_fence = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(idx, line)| (line.trim() == "```toml").then_some(idx))
+        .ok_or_else(|| anyhow::anyhow!("missing opening TOML code fence"))?;
+
+    let close_fence = lines
+        .iter()
+        .enumerate()
+        .skip(open_fence + 1)
+        .find_map(|(idx, line)| line.trim().starts_with("```").then_some(idx))
+        .ok_or_else(|| anyhow::anyhow!("missing closing TOML code fence"))?;
+
+    Ok((open_fence + 1, close_fence))
+}
+
+fn first_section_or_close(
+    lines: &[String],
+    block_start: usize,
+    block_end: usize,
+) -> anyhow::Result<usize> {
+    for i in block_start..=block_end {
+        let trimmed = lines
+            .get(i)
+            .map(String::as_str)
+            .ok_or_else(|| anyhow::anyhow!("metadata block line {i} missing"))?
+            .trim_start();
+        if trimmed.starts_with('[') || trimmed.starts_with("```") {
+            return Ok(i);
+        }
+    }
+    anyhow::bail!("malformed TOML metadata block")
+}
+
+fn insert_missing_top_level_key(
+    lines: &mut Vec<String>,
+    block_start: usize,
+    block_end: usize,
+    key: &str,
+    val_str: &str,
+) -> anyhow::Result<()> {
+    let mut insert_at = first_section_or_close(lines, block_start, block_end)?;
+    if insert_at > block_start && lines[insert_at - 1].trim().is_empty() {
+        insert_at -= 1;
+    }
+    lines.insert(insert_at, format!("  {key} = {val_str}"));
+    Ok(())
+}
+
+fn insert_missing_section_key(
+    lines: &mut Vec<String>,
+    block_start: usize,
+    block_end: usize,
+    table_name: &str,
+    field_name: &str,
+    val_str: &str,
+) -> anyhow::Result<()> {
+    let section_header = format!("[{table_name}]");
+    let mut section_line = None;
+    let mut insert_at = None;
+
+    for i in block_start..=block_end {
+        let trimmed = lines
+            .get(i)
+            .map(String::as_str)
+            .ok_or_else(|| anyhow::anyhow!("metadata block line {i} missing"))?
+            .trim_start();
+        if section_line.is_none() && trimmed == section_header {
+            section_line = Some(i);
+            continue;
+        }
+        if section_line.is_some() && (trimmed.starts_with('[') || trimmed.starts_with("```")) {
+            insert_at = Some(i);
+            break;
+        }
+    }
+
+    if let Some(section_line) = section_line {
+        let insert_at = insert_at.unwrap_or(block_end);
+        let _ = section_line;
+        lines.insert(insert_at, format!("  {field_name} = {val_str}"));
+        return Ok(());
+    }
+
+    let insert_at = first_section_or_close(lines, block_start, block_end)?;
+    if insert_at > 0 && !lines[insert_at - 1].trim().is_empty() {
+        lines.insert(insert_at, String::new());
+        lines.insert(insert_at + 1, format!("  [{table_name}]"));
+        lines.insert(insert_at + 2, format!("  {field_name} = {val_str}"));
+    } else {
+        lines.insert(insert_at, format!("  [{table_name}]"));
+        lines.insert(insert_at + 1, format!("  {field_name} = {val_str}"));
+    }
+    Ok(())
 }
 
 /// Format `content` by running hooks in sequence:
@@ -162,14 +281,22 @@ pub async fn format_content(content: &str, config: &WikiConfig) -> String {
     let zk = &config.zk_config;
     let mut current = content.to_string();
     if !zk.disable_default_hooks {
-        current = run_default_hooks(&current);
+        current = run_default_hooks_with_metadata_fields(&current, &zk.metadata.fields);
     }
-    current = run_hooks(&current, &zk.hooks);
+    current = run_hooks(&current, &zk.hooks, &zk.metadata.fields);
     current
 }
 
 /// Run the built-in embedded hooks (checklist.lua + relation_status.lua).
+#[allow(dead_code)]
 pub(crate) fn run_default_hooks(content: &str) -> String {
+    run_default_hooks_with_metadata_fields(content, &[])
+}
+
+pub(crate) fn run_default_hooks_with_metadata_fields(
+    content: &str,
+    metadata_fields: &[MetadataFieldConfig],
+) -> String {
     let hooks: &[(&str, &str)] = &[
         ("checklist", DEFAULT_CHECKLIST_HOOK),
         ("relation_status", DEFAULT_RELATION_HOOK),
@@ -183,7 +310,7 @@ pub(crate) fn run_default_hooks(content: &str) -> String {
                 continue;
             }
         };
-        let input = build_hook_note_input(&current);
+        let input = build_hook_note_input_with_metadata_fields(&current, metadata_fields);
         let result = match runner.run(&input) {
             Ok(r) => r,
             Err(e) => {
@@ -200,7 +327,11 @@ pub(crate) fn run_default_hooks(content: &str) -> String {
 }
 
 /// Run user-configured file hooks loaded at runtime. No-op if `hook_paths` is empty.
-pub(crate) fn run_hooks(content: &str, hook_paths: &[PathBuf]) -> String {
+pub(crate) fn run_hooks(
+    content: &str,
+    hook_paths: &[PathBuf],
+    metadata_fields: &[MetadataFieldConfig],
+) -> String {
     let mut current = content.to_string();
     for path in hook_paths {
         let name = path
@@ -214,7 +345,7 @@ pub(crate) fn run_hooks(content: &str, hook_paths: &[PathBuf]) -> String {
                 continue;
             }
         };
-        let input = build_hook_note_input(&current);
+        let input = build_hook_note_input_with_metadata_fields(&current, metadata_fields);
         let result = match runner.run(&input) {
             Ok(r) => r,
             Err(e) => {
@@ -228,6 +359,87 @@ pub(crate) fn run_hooks(content: &str, hook_paths: &[PathBuf]) -> String {
         }
     }
     current
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_metadata_patch;
+    use std::collections::HashMap;
+
+    fn note_with_user_section() -> String {
+        concat!(
+            "#import \"../include.typ\": *\n",
+            "#let zk-metadata = toml(bytes(\n",
+            "  ```toml\n",
+            "  schema-version = 1\n",
+            "  aliases = []\n",
+            "  abstract = \"\"\n",
+            "  keywords = []\n",
+            "  generated = false\n",
+            "  checklist-status = \"none\"\n",
+            "  relation = \"active\"\n",
+            "  relation-target = []\n",
+            "\n",
+            "  [user]\n",
+            "  priority = \"normal\"\n",
+            "  ```.text,\n",
+            "))\n",
+            "#show: zettel.with(metadata: zk-metadata)\n",
+            "\n",
+            "= Test <2601010000>\n",
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn apply_metadata_patch_inserts_missing_top_level_key() {
+        let note = note_with_user_section();
+        let mut patch = HashMap::new();
+        patch.insert(
+            "new-top-level".to_string(),
+            toml::Value::String("value".to_string()),
+        );
+
+        let output = apply_metadata_patch(&note, &patch).expect("patch should apply");
+        let key_pos = output
+            .find("  new-top-level = \"value\"")
+            .expect("inserted key present");
+        let section_pos = output.find("  [user]").expect("user section present");
+        assert!(
+            key_pos < section_pos,
+            "top-level key should be inserted before [user]"
+        );
+    }
+
+    #[test]
+    fn apply_metadata_patch_inserts_missing_section_key() {
+        let note = note_with_user_section();
+        let mut patch = HashMap::new();
+        patch.insert("user.reviewed".to_string(), toml::Value::Boolean(false));
+
+        let output = apply_metadata_patch(&note, &patch).expect("patch should apply");
+        assert!(output.contains("  [user]\n  priority = \"normal\"\n  reviewed = false"));
+    }
+
+    #[test]
+    fn apply_metadata_patch_creates_missing_section() {
+        let note = note_with_user_section().replace("\n  [user]\n  priority = \"normal\"", "");
+        let mut patch = HashMap::new();
+        patch.insert(
+            "user.priority".to_string(),
+            toml::Value::String("normal".to_string()),
+        );
+
+        let output = apply_metadata_patch(&note, &patch).expect("patch should apply");
+        let section_pos = output.find("  [user]").expect("user section created");
+        let key_pos = output
+            .find("  priority = \"normal\"")
+            .expect("priority inserted");
+        assert!(
+            section_pos < key_pos,
+            "inserted key should be inside created section"
+        );
+    }
 }
 
 /// Compute the TextEdit needed to update `checklist-status` in a TOML metadata

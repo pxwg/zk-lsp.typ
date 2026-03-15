@@ -3,8 +3,10 @@ use std::path::Path;
 use mlua::{Lua, Value as LuaValue};
 
 use super::types::{
-    HookCheckbox, HookHeading, HookNoteInput, HookResult, HookSpan, HookTextEdit, HookTitle,
+    HookCheckbox, HookHeading, HookMetadataField, HookNoteInput, HookResult, HookSpan,
+    HookTextEdit, HookTitle,
 };
+use crate::config::{MetadataFieldConfig, MetadataFieldKind};
 use crate::parser::{self, ChecklistItemKind};
 
 /// A loaded Lua hook script that exposes a `run(note) -> result` function.
@@ -36,7 +38,7 @@ impl HookRunner {
         let run_fn: mlua::Function = self.lua.globals().get("run")?;
         let result_val: LuaValue = run_fn.call(table)?;
         match result_val {
-            LuaValue::Table(t) => lua_table_to_hook_result(t),
+            LuaValue::Table(t) => lua_table_to_hook_result(t, input),
             LuaValue::Nil => Ok(HookResult::default()),
             _ => anyhow::bail!(
                 "`run` must return a table or nil, got {:?}",
@@ -78,6 +80,13 @@ fn span_for_line(line_offsets: &[usize], line_idx: usize, line_len: usize) -> Ho
 // ---------------------------------------------------------------------------
 
 pub fn build_hook_note_input(content: &str) -> HookNoteInput {
+    build_hook_note_input_with_metadata_fields(content, &[])
+}
+
+pub fn build_hook_note_input_with_metadata_fields(
+    content: &str,
+    metadata_fields: &[MetadataFieldConfig],
+) -> HookNoteInput {
     let lines: Vec<&str> = content.lines().collect();
     let line_offsets = build_line_byte_offsets(content);
 
@@ -104,6 +113,7 @@ pub fn build_hook_note_input(content: &str) -> HookNoteInput {
     let metadata = parser::find_toml_metadata_block(content)
         .and_then(|b| b.toml_content.parse::<toml::Table>().ok())
         .unwrap_or_default();
+    let metadata_defaults = metadata_defaults_table(metadata_fields);
 
     // Parse checkboxes
     let checkboxes = parser::parse_checklist_items(content)
@@ -157,14 +167,28 @@ pub fn build_hook_note_input(content: &str) -> HookNoteInput {
             }
         })
         .collect();
+    let metadata_fields = metadata_fields
+        .iter()
+        .map(|field| HookMetadataField {
+            path: field.path.clone(),
+            kind: match field.kind {
+                MetadataFieldKind::String => "string".to_string(),
+                MetadataFieldKind::Boolean => "boolean".to_string(),
+                MetadataFieldKind::ArrayString => "array-string".to_string(),
+            },
+            default: field.default.clone(),
+        })
+        .collect();
 
     HookNoteInput {
         id,
         title,
         content: content.to_string(),
         metadata,
+        metadata_defaults,
         checkboxes,
         headings,
+        metadata_fields,
     }
 }
 
@@ -217,6 +241,23 @@ fn toml_table_to_lua(lua: &Lua, table: &toml::Table) -> mlua::Result<mlua::Table
     Ok(t)
 }
 
+fn metadata_defaults_table(metadata_fields: &[MetadataFieldConfig]) -> toml::Table {
+    let mut defaults = toml::Table::new();
+    for field in metadata_fields {
+        let Some(sub_key) = field.path.strip_prefix("user.") else {
+            continue;
+        };
+        let user_entry = defaults
+            .entry("user".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let toml::Value::Table(user_table) = user_entry else {
+            continue;
+        };
+        user_table.insert(sub_key.to_string(), field.default.clone());
+    }
+    defaults
+}
+
 fn note_input_to_lua(lua: &Lua, input: &HookNoteInput) -> anyhow::Result<mlua::Table> {
     let t = lua.create_table()?;
 
@@ -238,6 +279,10 @@ fn note_input_to_lua(lua: &Lua, input: &HookNoteInput) -> anyhow::Result<mlua::T
 
     // metadata
     t.set("metadata", toml_table_to_lua(lua, &input.metadata)?)?;
+    t.set(
+        "metadata_defaults",
+        toml_table_to_lua(lua, &input.metadata_defaults)?,
+    )?;
 
     // checkboxes (1-indexed array)
     let cbs = lua.create_table()?;
@@ -269,6 +314,16 @@ fn note_input_to_lua(lua: &Lua, input: &HookNoteInput) -> anyhow::Result<mlua::T
         hdgs.set(i + 1, ht)?;
     }
     t.set("headings", hdgs)?;
+
+    let fields = lua.create_table()?;
+    for (i, field) in input.metadata_fields.iter().enumerate() {
+        let ft = lua.create_table()?;
+        ft.set("path", field.path.as_str())?;
+        ft.set("kind", field.kind.as_str())?;
+        ft.set("default", toml_value_to_lua(lua, &field.default)?)?;
+        fields.set(i + 1, ft)?;
+    }
+    t.set("metadata_fields", fields)?;
 
     Ok(t)
 }
@@ -310,14 +365,45 @@ fn lua_value_to_toml(value: &LuaValue) -> anyhow::Result<toml::Value> {
     }
 }
 
-fn lua_table_to_hook_result(table: mlua::Table) -> anyhow::Result<HookResult> {
+fn metadata_default_for_path<'a>(input: &'a HookNoteInput, path: &str) -> Option<&'a toml::Value> {
+    let mut segments = path.split('.');
+    let first = segments.next()?;
+    let mut current = input.metadata_defaults.get(first)?;
+    for segment in segments {
+        current = current.as_table()?.get(segment)?;
+    }
+    Some(current)
+}
+
+fn lua_value_to_toml_with_default(
+    value: &LuaValue,
+    default: Option<&toml::Value>,
+) -> anyhow::Result<toml::Value> {
+    if let (LuaValue::Table(t), Some(toml::Value::Array(arr))) = (value, default) {
+        if t.raw_len() == 0
+            && t.clone().pairs::<String, LuaValue>().next().is_none()
+            && arr.is_empty()
+        {
+            return Ok(toml::Value::Array(Vec::new()));
+        }
+    }
+    lua_value_to_toml(value)
+}
+
+fn lua_table_to_hook_result(
+    table: mlua::Table,
+    input: &HookNoteInput,
+) -> anyhow::Result<HookResult> {
     let mut result = HookResult::default();
 
     // metadata (optional)
     if let Ok(LuaValue::Table(meta_tbl)) = table.get::<LuaValue>("metadata") {
         for pair in meta_tbl.pairs::<String, LuaValue>() {
             let (k, v) = pair?;
-            result.metadata.insert(k, lua_value_to_toml(&v)?);
+            let default = metadata_default_for_path(input, &k);
+            result
+                .metadata
+                .insert(k, lua_value_to_toml_with_default(&v, default)?);
         }
     }
 
@@ -370,6 +456,7 @@ fn lua_table_to_hook_result(table: mlua::Table) -> anyhow::Result<HookResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{MetadataFieldConfig, MetadataFieldKind};
     use crate::handlers::formatting::run_default_hooks;
     use crate::hooks::apply::{apply_hook_result, validate_hook_result};
     use std::collections::HashMap;
@@ -704,6 +791,55 @@ end
         assert!(
             output.contains("checklist-status = \"todo\""),
             "hook value applied directly; got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_metadata_defaults_exposed_to_lua() {
+        let note = make_toml_note("Test", "2601010012", "none", "active", "");
+        let fields = vec![MetadataFieldConfig {
+            path: "user.priority".into(),
+            kind: MetadataFieldKind::String,
+            default: toml::Value::String("normal".into()),
+        }];
+        let input = build_hook_note_input_with_metadata_fields(&note, &fields);
+
+        let runner = HookRunner::load_str(
+            r#"function run(n)
+                 return {
+                   metadata = {
+                     ["checklist-status"] = n.metadata_defaults.user.priority
+                   }
+                 }
+               end"#,
+        )
+        .unwrap();
+        let result = runner.run(&input).unwrap();
+        assert_eq!(
+            result.metadata.get("checklist-status"),
+            Some(&toml::Value::String("normal".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_empty_array_default_round_trips_from_lua_metadata_patch() {
+        let note = make_toml_note("Test", "2601010013", "none", "active", "");
+        let fields = vec![MetadataFieldConfig {
+            path: "user.tags".into(),
+            kind: MetadataFieldKind::ArrayString,
+            default: toml::Value::Array(vec![]),
+        }];
+        let input = build_hook_note_input_with_metadata_fields(&note, &fields);
+        let runner = HookRunner::load_str(
+            r#"function run(n)
+                 return { metadata = { ["user.tags"] = n.metadata_defaults.user.tags } }
+               end"#,
+        )
+        .unwrap();
+        let result = runner.run(&input).unwrap();
+        assert_eq!(
+            result.metadata.get("user.tags"),
+            Some(&toml::Value::Array(vec![]))
         );
     }
 

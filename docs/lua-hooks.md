@@ -46,8 +46,19 @@ The `note` argument passed to `run` is a Lua table matching the
 ---@field title      Title|nil           -- title heading; nil if unparseable
 ---@field content    string              -- full raw note content
 ---@field metadata   table<string, any>  -- TOML metadata key→value pairs
+---@field metadata_defaults table<string, any> -- config-declared default metadata values
 ---@field checkboxes Checkbox[]          -- all checklist items in source order
 ---@field headings   Heading[]           -- all headings (level 1..6)
+---@field metadata_fields MetadataField[] -- config-declared metadata fields
+```
+
+### `MetadataField`
+
+```lua
+---@class MetadataField
+---@field path string   -- dotted path, e.g. "user.priority"
+---@field kind string   -- "string" | "boolean" | "array-string"
+---@field default any   -- configured default value
 ```
 
 ### `Title`
@@ -294,6 +305,56 @@ end
 
 An external script can then query the field with `zk-lsp note-info <id>` and
 decide whether the note needs further processing.
+
+### 5 — Backfill missing metadata keys from config defaults
+
+Useful when `[[metadata.field]]` adds a new key and older notes have not been
+updated yet. On save, the hook emits only missing keys; `zk-lsp` handles the
+actual TOML patching and insertion into the metadata block.
+
+```lua
+-- hooks/ensure_metadata_defaults.lua
+local function lookup_path(tbl, path)
+  local current = tbl
+  for segment in path:gmatch("[^.]+") do
+    if type(current) ~= "table" then return nil end
+    current = current[segment]
+    if current == nil then return nil end
+  end
+  return current
+end
+
+function run(note)
+  local patch = {}
+
+  for _, field in ipairs(note.metadata_fields or {}) do
+    if lookup_path(note.metadata, field.path) == nil then
+      patch[field.path] = field.default
+    end
+  end
+
+  if next(patch) == nil then
+    return {}
+  end
+
+  return { metadata = patch }
+end
+```
+
+Config:
+
+```toml
+[[metadata.field]]
+path = "user.priority"
+kind = "string"
+default = "normal"
+
+[[hook]]
+path = "./hooks/ensure_metadata_defaults.lua"
+```
+
+See [`examples/hooks/ensure_metadata_defaults.lua`](../examples/hooks/ensure_metadata_defaults.lua)
+for the full sample.
 
 ---
 

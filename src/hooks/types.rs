@@ -93,10 +93,28 @@ pub struct HookNoteInput {
     pub content: String,
     /// Parsed TOML metadata block (key → value).
     pub metadata: toml::Table,
+    /// Default values for config-declared metadata fields.
+    ///
+    /// The shape mirrors TOML layout exposed in [`metadata`]. For example,
+    /// `user.priority` appears as `{ user = { priority = "normal" } }`.
+    pub metadata_defaults: toml::Table,
     /// All checklist items in source order.
     pub checkboxes: Vec<HookCheckbox>,
     /// All headings in source order.
     pub headings: Vec<HookHeading>,
+    /// Config-declared metadata fields in declaration order.
+    pub metadata_fields: Vec<HookMetadataField>,
+}
+
+/// A config-declared metadata field exposed to Lua hooks.
+#[derive(Debug, Clone)]
+pub struct HookMetadataField {
+    /// Dotted field path, e.g. `user.priority`.
+    pub path: String,
+    /// Declared kind string: `string`, `boolean`, or `array-string`.
+    pub kind: String,
+    /// Default value from config.
+    pub default: toml::Value,
 }
 
 /// A single byte-range text replacement returned by a hook.

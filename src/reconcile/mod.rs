@@ -941,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn materialized_meta_missing_key_fails_instead_of_silently_skipping() {
+    fn materialized_meta_missing_key_is_inserted() {
         let src = r#"
         (module
           (define (materialized_fields n)
@@ -958,9 +958,12 @@ mod tests {
              #let zk-metadata = toml(bytes(\n\
              \x20 ```toml\n\
              \x20 schema-version = 1\n\
-             \x20 title = \"A\"\n\
-             \x20 tags = []\n\
+             \x20 aliases = []\n\
+             \x20 abstract = \"\"\n\
+             \x20 keywords = []\n\
              \x20 checklist-status = \"none\"\n\
+             \x20 relation = \"active\"\n\
+             \x20 relation-target = []\n\
              \x20 generated = false\n\
              \x20 ```.text,\n\
              ))\n\
@@ -969,11 +972,11 @@ mod tests {
              = A <1111111111>\n";
         let snap = snapshot_from(&[("1111111111", note)]);
         let result = materialize(eval_all(&module, &snap));
-        let err =
-            apply_materialized_metadata("1111111111", note, &result).expect_err("should fail");
+        let updated = apply_materialized_metadata("1111111111", note, &result)
+            .expect("materialize metadata")
+            .expect("metadata edit");
 
-        assert!(err
-            .to_string()
-            .contains("failed to write materialized metadata"));
+        assert!(updated.contains("  [user]"));
+        assert!(updated.contains("  label = \"synced\""));
     }
 }

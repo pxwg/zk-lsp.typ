@@ -205,6 +205,10 @@ disable_default_hooks = false   # set true to skip built-in checklist + relation
 path = "~/.config/zk-lsp/hooks/my_hook.lua"
 ```
 
+Example: [`examples/hooks/ensure_metadata_defaults.lua`](examples/hooks/ensure_metadata_defaults.lua)
+backfills newly added `[[metadata.field]]` keys on save using their configured
+defaults.
+
 See [docs/lua-hooks.md](docs/lua-hooks.md) for the full hook API and examples.
 
 ### Reconcile rules

@@ -33,8 +33,15 @@
 ---@field title      Title|nil   Title heading (nil if not parseable)
 ---@field content    string      Raw note content
 ---@field metadata   table<string, any>  TOML metadata key→value map
+---@field metadata_defaults table<string, any>  Default values for config-declared metadata fields
 ---@field checkboxes Checkbox[]
 ---@field headings   Heading[]
+---@field metadata_fields MetadataField[]
+
+---@class MetadataField
+---@field path string     Dotted path, e.g. "user.priority"
+---@field kind string     "string" | "boolean" | "array-string"
+---@field default any     Configured default value
 
 ---@class TextEdit
 ---@field start_byte integer  Byte offset of range start in `content`
