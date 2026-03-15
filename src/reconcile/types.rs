@@ -50,6 +50,8 @@ impl fmt::Display for Status {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
     Bool(bool),
+    Int(i64),
+    Nil,
     Status(Status),
     List(Rc<Vec<Value>>),
     /// Runtime-only: a reference to a note (used inside the evaluator).
@@ -64,6 +66,8 @@ pub enum Value {
 pub enum Type {
     Any,
     Bool,
+    Int,
+    Nil,
     Status,
     String,
     NoteRef,
@@ -76,6 +80,8 @@ impl fmt::Display for Type {
         match self {
             Type::Any => write!(f, "Any"),
             Type::Bool => write!(f, "Bool"),
+            Type::Int => write!(f, "Int"),
+            Type::Nil => write!(f, "Nil"),
             Type::Status => write!(f, "Status"),
             Type::String => write!(f, "String"),
             Type::NoteRef => write!(f, "NoteRef"),

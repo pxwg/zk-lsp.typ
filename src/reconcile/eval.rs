@@ -160,6 +160,72 @@ impl<'a> Evaluator<'a> {
                 }
                 Ok(Value::List(Rc::new(results)))
             }
+            "filter" => {
+                let fn_name = match arg_exprs.first() {
+                    Some(Expr::Var(name)) => name.clone(),
+                    _ => {
+                        return Err(EvalError::TypeMismatch {
+                            context: "filter: first arg must be a function symbol".to_string(),
+                        })
+                    }
+                };
+                let list_val = self.eval_expr(
+                    arg_exprs.get(1).ok_or_else(|| EvalError::TypeMismatch {
+                        context: "filter: missing list arg".to_string(),
+                    })?,
+                    env,
+                )?;
+                let Value::List(items) = list_val else {
+                    return Err(EvalError::TypeMismatch {
+                        context: "filter: second arg must be a list".to_string(),
+                    });
+                };
+                let mut results = Vec::new();
+                for item in items.iter() {
+                    let keep = self.invoke_function(&fn_name, vec![item.clone()])?;
+                    match keep {
+                        Value::Bool(true) => results.push(item.clone()),
+                        Value::Bool(false) => {}
+                        _ => {
+                            return Err(EvalError::TypeMismatch {
+                                context: format!("filter: predicate '{fn_name}' must return Bool"),
+                            })
+                        }
+                    }
+                }
+                Ok(Value::List(Rc::new(results)))
+            }
+            "reduce" => {
+                let fn_name = match arg_exprs.first() {
+                    Some(Expr::Var(name)) => name.clone(),
+                    _ => {
+                        return Err(EvalError::TypeMismatch {
+                            context: "reduce: first arg must be a function symbol".to_string(),
+                        })
+                    }
+                };
+                let mut acc = self.eval_expr(
+                    arg_exprs.get(1).ok_or_else(|| EvalError::TypeMismatch {
+                        context: "reduce: missing init arg".to_string(),
+                    })?,
+                    env,
+                )?;
+                let list_val = self.eval_expr(
+                    arg_exprs.get(2).ok_or_else(|| EvalError::TypeMismatch {
+                        context: "reduce: missing list arg".to_string(),
+                    })?,
+                    env,
+                )?;
+                let Value::List(items) = list_val else {
+                    return Err(EvalError::TypeMismatch {
+                        context: "reduce: third arg must be a list".to_string(),
+                    });
+                };
+                for item in items.iter() {
+                    acc = self.invoke_function(&fn_name, vec![acc, item.clone()])?;
+                }
+                Ok(acc)
+            }
             "list" => {
                 let values = arg_exprs
                     .iter()
@@ -333,6 +399,86 @@ impl<'a> Evaluator<'a> {
                     context: "local_checkboxes".to_string(),
                 }),
             },
+            "+" => int_binary_op(args, "+", |a, b| a.wrapping_add(b)),
+            "-" => int_binary_op(args, "-", |a, b| a.wrapping_sub(b)),
+            "<" => int_comparison(args, "<", |a, b| a < b),
+            ">" => int_comparison(args, ">", |a, b| a > b),
+            "<=" => int_comparison(args, "<=", |a, b| a <= b),
+            ">=" => int_comparison(args, ">=", |a, b| a >= b),
+            "backlinks" => match args {
+                [Value::NoteRef(id)] => Ok(Value::List(Rc::new(
+                    self.snapshot
+                        .backlinks(id)
+                        .iter()
+                        .map(|note_id| Value::NoteRef(note_id.clone()))
+                        .collect(),
+                ))),
+                _ => Err(EvalError::TypeMismatch {
+                    context: "backlinks".to_string(),
+                }),
+            },
+            "parent" => match args {
+                [Value::CheckboxRef(id)] => Ok(self
+                    .snapshot
+                    .parent(id)
+                    .map(|pid| Value::CheckboxRef(pid.clone()))
+                    .unwrap_or(Value::Nil)),
+                _ => Err(EvalError::TypeMismatch {
+                    context: "parent".to_string(),
+                }),
+            },
+            "nil?" => match args {
+                [v] => Ok(Value::Bool(matches!(v, Value::Nil))),
+                _ => Err(EvalError::TypeMismatch {
+                    context: "nil?".to_string(),
+                }),
+            },
+            "owner_note" => match args {
+                [Value::CheckboxRef(id)] => Ok(Value::NoteRef(id.note_id.clone())),
+                _ => Err(EvalError::TypeMismatch {
+                    context: "owner_note".to_string(),
+                }),
+            },
+            "length" => match args {
+                [Value::List(items)] => Ok(Value::Int(items.len() as i64)),
+                _ => Err(EvalError::TypeMismatch {
+                    context: "length".to_string(),
+                }),
+            },
+            "union" => match args {
+                [Value::List(xs), Value::List(ys)] => {
+                    let mut result: Vec<Value> = xs.as_ref().clone();
+                    for item in ys.iter() {
+                        if !result.contains(item) {
+                            result.push(item.clone());
+                        }
+                    }
+                    Ok(Value::List(Rc::new(result)))
+                }
+                _ => Err(EvalError::TypeMismatch {
+                    context: "union".to_string(),
+                }),
+            },
+            "contains?" => match args {
+                [Value::List(items), needle] => Ok(Value::Bool(items.contains(needle))),
+                _ => Err(EvalError::TypeMismatch {
+                    context: "contains?".to_string(),
+                }),
+            },
+            "dedup" => match args {
+                [Value::List(items)] => {
+                    let mut seen = Vec::new();
+                    for item in items.iter() {
+                        if !seen.contains(item) {
+                            seen.push(item.clone());
+                        }
+                    }
+                    Ok(Value::List(Rc::new(seen)))
+                }
+                _ => Err(EvalError::TypeMismatch {
+                    context: "dedup".to_string(),
+                }),
+            },
             _ => Err(EvalError::UnknownFunction(name.to_string())),
         }
     }
@@ -361,7 +507,10 @@ impl<'a> Evaluator<'a> {
     fn call_return_type(&self, name: &str, args: &[Value]) -> Type {
         match name {
             "empty?" | "all_done" | "all_done?" | "eq?" | "not" | "and" | "or" => Type::Bool,
-            "done?" | "todo?" | "wip?" | "none?" => Type::Bool,
+            "done?" | "todo?" | "wip?" | "none?" | "nil?" | "contains?" => Type::Bool,
+            "<" | ">" | "<=" | ">=" => Type::Bool,
+            "+" | "-" => Type::Int,
+            "length" => Type::Int,
             "observe_checked" | "aggregate_status" => Type::Status,
             "observe_meta" => match args.get(1) {
                 Some(Value::String(field)) => self
@@ -372,9 +521,11 @@ impl<'a> Evaluator<'a> {
                     .unwrap_or(Type::String),
                 _ => Type::Any,
             },
-            "targets" => Type::List(Box::new(Type::NoteRef)),
+            "targets" | "backlinks" => Type::List(Box::new(Type::NoteRef)),
             "children" | "local_checkboxes" => Type::List(Box::new(Type::CheckboxRef)),
-            "map" | "list" => Type::List(Box::new(Type::Any)),
+            "map" | "filter" | "list" | "union" | "dedup" => Type::List(Box::new(Type::Any)),
+            "parent" => Type::Any,
+            "owner_note" => Type::NoteRef,
             _ => self
                 .type_info
                 .rule_return_types
@@ -387,6 +538,8 @@ impl<'a> Evaluator<'a> {
     fn unknown_value_for_type(&self, ty: Type) -> Value {
         match ty {
             Type::Bool => Value::Bool(false),
+            Type::Int => Value::Int(0),
+            Type::Nil => Value::Nil,
             Type::Status => Value::Status(self.module.policy.unknown_status.clone()),
             Type::String | Type::Any => Value::String(Rc::from("")),
             Type::List(_) => Value::List(Rc::new(Vec::new())),
@@ -402,6 +555,8 @@ impl<'a> Evaluator<'a> {
 fn value_type(value: &Value) -> Type {
     match value {
         Value::Bool(_) => Type::Bool,
+        Value::Int(_) => Type::Int,
+        Value::Nil => Type::Nil,
         Value::Status(_) => Type::Status,
         Value::List(items) => items
             .first()
@@ -411,6 +566,32 @@ fn value_type(value: &Value) -> Type {
         Value::NoteRef(_) => Type::NoteRef,
         Value::CheckboxRef(_) => Type::CheckboxRef,
         Value::String(_) => Type::String,
+    }
+}
+
+fn int_binary_op(
+    args: &[Value],
+    context: &str,
+    op: impl Fn(i64, i64) -> i64,
+) -> Result<Value, EvalError> {
+    match args {
+        [Value::Int(a), Value::Int(b)] => Ok(Value::Int(op(*a, *b))),
+        _ => Err(EvalError::TypeMismatch {
+            context: context.to_string(),
+        }),
+    }
+}
+
+fn int_comparison(
+    args: &[Value],
+    context: &str,
+    pred: impl Fn(i64, i64) -> bool,
+) -> Result<Value, EvalError> {
+    match args {
+        [Value::Int(a), Value::Int(b)] => Ok(Value::Bool(pred(*a, *b))),
+        _ => Err(EvalError::TypeMismatch {
+            context: context.to_string(),
+        }),
     }
 }
 
@@ -690,6 +871,194 @@ mod tests {
         assert_eq!(
             checklist_status_field(&result, "1111111111"),
             Some(Status::Done)
+        );
+    }
+
+    fn get_int_meta(result: &EvalResult, note_id: &str, field: &str) -> Option<i64> {
+        result
+            .effective_meta
+            .get(&(note_id.to_string(), field.to_string()))
+            .and_then(|v| match v {
+                Value::Int(n) => Some(*n),
+                _ => None,
+            })
+    }
+
+    fn get_str_meta(result: &EvalResult, note_id: &str, field: &str) -> Option<String> {
+        result
+            .effective_meta
+            .get(&(note_id.to_string(), field.to_string()))
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.to_string()),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn reduce_adds_integers() {
+        let src = r#"
+        (module
+          (define (materialized_fields n) (list "user.sum"))
+          (define (effective_checked c) (observe_checked c))
+          (define (effective_meta n field)
+            (if (eq? field "user.sum")
+                (reduce + 0 (list 1 2 3))
+                (observe_meta n field))))
+        "#;
+        let module = parse_module(src).expect("parse");
+        let content = make_toml_note("A", "1111111111", "none", "");
+        let snap = snapshot_from(&[("1111111111", &content)]);
+        let result = eval_all(&module, &snap);
+        assert!(result.diagnostics.is_empty());
+        assert_eq!(get_int_meta(&result, "1111111111", "user.sum"), Some(6));
+    }
+
+    #[test]
+    fn filter_and_length_count_done_backlinks() {
+        // A is referenced by B (done) and C (todo); filter keeps only B → length = 1
+        let src = r#"
+        (module
+          (define (materialized_fields n) (list "user.done_count"))
+          (define (effective_checked c) (observe_checked c))
+          (define (is_done m) (done? (observe_meta m "checklist-status")))
+          (define (effective_meta n field)
+            (if (eq? field "user.done_count")
+                (length (filter is_done (backlinks n)))
+                (observe_meta n field))))
+        "#;
+        let module = parse_module(src).expect("parse");
+        let note_a = make_toml_note("A", "1111111111", "none", "");
+        let note_b = make_toml_note("B", "2222222222", "done", "- [ ] @1111111111\n");
+        let note_c = make_toml_note("C", "3333333333", "todo", "- [ ] @1111111111\n");
+        let snap = snapshot_from(&[
+            ("1111111111", &note_a),
+            ("2222222222", &note_b),
+            ("3333333333", &note_c),
+        ]);
+        let result = eval_all(&module, &snap);
+        assert!(result.diagnostics.is_empty());
+        assert_eq!(
+            get_int_meta(&result, "1111111111", "user.done_count"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn comparison_and_backlink_threshold() {
+        // A has 2 done backlinks; >= 2 → "yes"
+        let src = r#"
+        (module
+          (define (materialized_fields n) (list "user.verified"))
+          (define (effective_checked c) (observe_checked c))
+          (define (is_done m) (done? (observe_meta m "checklist-status")))
+          (define (effective_meta n field)
+            (if (eq? field "user.verified")
+                (if (>= (length (filter is_done (backlinks n))) 2)
+                    "yes"
+                    "no")
+                (observe_meta n field))))
+        "#;
+        let module = parse_module(src).expect("parse");
+        let note_a = make_toml_note("A", "1111111111", "none", "");
+        let note_b = make_toml_note("B", "2222222222", "done", "- [ ] @1111111111\n");
+        let note_c = make_toml_note("C", "3333333333", "done", "- [ ] @1111111111\n");
+        let note_d = make_toml_note("D", "4444444444", "todo", "- [ ] @1111111111\n");
+        let snap = snapshot_from(&[
+            ("1111111111", &note_a),
+            ("2222222222", &note_b),
+            ("3333333333", &note_c),
+            ("4444444444", &note_d),
+        ]);
+        let result = eval_all(&module, &snap);
+        assert!(result.diagnostics.is_empty());
+        assert_eq!(
+            get_str_meta(&result, "1111111111", "user.verified"),
+            Some("yes".to_string())
+        );
+    }
+
+    #[test]
+    fn nil_predicate_root_vs_child() {
+        // Root checkboxes have no parent (→ Nil); children have a parent.
+        let content = make_toml_note("A", "1111111111", "none", "- [ ] root\n  - [x] child\n");
+        let snap = snapshot_from(&[("1111111111", &content)]);
+        let checkboxes = snap.local_checkboxes(&"1111111111".to_string());
+        assert_eq!(checkboxes.len(), 2);
+        assert!(snap.parent(&checkboxes[0]).is_none(), "root → Nil");
+        assert!(snap.parent(&checkboxes[1]).is_some(), "child has parent");
+    }
+
+    #[test]
+    fn backlinks_reverse_index() {
+        let note_a = make_toml_note("A", "1111111111", "none", "");
+        let note_b = make_toml_note("B", "2222222222", "none", "- [ ] @1111111111\n");
+        let snap = snapshot_from(&[("1111111111", &note_a), ("2222222222", &note_b)]);
+        assert_eq!(
+            snap.backlinks(&"1111111111".to_string()),
+            &["2222222222".to_string()]
+        );
+        assert!(snap.backlinks(&"2222222222".to_string()).is_empty());
+    }
+
+    #[test]
+    fn owner_note_returns_containing_note_id() {
+        let content = make_toml_note("A", "1111111111", "none", "- [ ] task\n");
+        let snap = snapshot_from(&[("1111111111", &content)]);
+        let checkboxes = snap.local_checkboxes(&"1111111111".to_string());
+        assert_eq!(checkboxes.len(), 1);
+        assert_eq!(checkboxes[0].note_id, "1111111111");
+    }
+
+    #[test]
+    fn union_and_dedup_eval() {
+        // A has 2 backlinks; union with itself stays 2; dedup of [A, A, B] → [A, B]
+        let src = r#"
+        (module
+          (define (materialized_fields n) (list "user.count"))
+          (define (effective_checked c) (observe_checked c))
+          (define (effective_meta n field)
+            (if (eq? field "user.count")
+                (length (dedup (union (backlinks n) (backlinks n))))
+                (observe_meta n field))))
+        "#;
+        let module = parse_module(src).expect("parse");
+        let note_a = make_toml_note("A", "1111111111", "none", "");
+        let note_b = make_toml_note("B", "2222222222", "none", "- [ ] @1111111111\n");
+        let note_c = make_toml_note("C", "3333333333", "none", "- [ ] @1111111111\n");
+        let snap = snapshot_from(&[
+            ("1111111111", &note_a),
+            ("2222222222", &note_b),
+            ("3333333333", &note_c),
+        ]);
+        let result = eval_all(&module, &snap);
+        assert!(result.diagnostics.is_empty());
+        // backlinks(A) = [B, C]; union with itself = [B, C]; dedup = [B, C]; length = 2
+        assert_eq!(get_int_meta(&result, "1111111111", "user.count"), Some(2));
+    }
+
+    #[test]
+    fn contains_predicate_eval() {
+        // Use contains? in effective_meta to check if a specific note is a backlink
+        let src = r#"
+        (module
+          (define (materialized_fields n) (list "user.has_backlink"))
+          (define (effective_checked c) (observe_checked c))
+          (define (effective_meta n field)
+            (if (eq? field "user.has_backlink")
+                (if (contains? (backlinks n) n)
+                    "yes"
+                    "no")
+                (observe_meta n field))))
+        "#;
+        // A has no self-backlink → "no"
+        let module = parse_module(src).expect("parse");
+        let note_a = make_toml_note("A", "1111111111", "none", "");
+        let snap = snapshot_from(&[("1111111111", &note_a)]);
+        let result = eval_all(&module, &snap);
+        assert!(result.diagnostics.is_empty());
+        assert_eq!(
+            get_str_meta(&result, "1111111111", "user.has_backlink"),
+            Some("no".to_string())
         );
     }
 

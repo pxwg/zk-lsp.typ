@@ -140,6 +140,8 @@ fn apply_materialized_metadata(
 fn value_to_toml(value: &Value) -> Option<toml::Value> {
     match value {
         Value::Bool(value) => Some(toml::Value::Boolean(*value)),
+        Value::Int(n) => Some(toml::Value::Integer(*n)),
+        Value::Nil => None,
         Value::Status(status) => Some(toml::Value::String(status.to_str().to_string())),
         Value::String(value) => Some(toml::Value::String(value.to_string())),
         Value::List(items) => {

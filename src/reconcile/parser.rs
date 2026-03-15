@@ -340,6 +340,10 @@ fn parse_expr(p: &mut Parser) -> Result<Expr, ParseError> {
                 "done" => return Ok(Expr::Lit(Value::Status(Status::Done))),
                 _ => {}
             }
+            // numeric literals
+            if let Ok(n) = s.parse::<i64>() {
+                return Ok(Expr::Lit(Value::Int(n)));
+            }
             Ok(Expr::Var(s))
         }
         Token::StringLit(_) => {
@@ -521,6 +525,86 @@ mod tests {
                 }
             }
             other => panic!("expected children expr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn numeric_literal_parsing() {
+        let src = r#"
+        (module
+          (define (get_count n) 42)
+          (define (get_neg n) -7)
+          (define (get_zero n) 0))
+        "#;
+        let module = parse_module(src).expect("should parse");
+        assert!(matches!(&module.rules[0].body, Expr::Lit(Value::Int(42))));
+        assert!(matches!(&module.rules[1].body, Expr::Lit(Value::Int(-7))));
+        assert!(matches!(&module.rules[2].body, Expr::Lit(Value::Int(0))));
+    }
+
+    #[test]
+    fn arithmetic_expr_parses() {
+        let src = r#"
+        (module
+          (define (add_one n) (+ n 1))
+          (define (is_less n) (< n 10)))
+        "#;
+        let module = parse_module(src).expect("should parse");
+        match &module.rules[0].body {
+            Expr::Call { name, args } => {
+                assert_eq!(name, "+");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected + call, got {other:?}"),
+        }
+        match &module.rules[1].body {
+            Expr::Call { name, args } => {
+                assert_eq!(name, "<");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected < call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn filter_reduce_parse() {
+        let src = r#"
+        (module
+          (define (filtered xs) (filter done? xs))
+          (define (total xs) (reduce + 0 xs)))
+        "#;
+        let module = parse_module(src).expect("should parse");
+        match &module.rules[0].body {
+            Expr::Call { name, args } => {
+                assert_eq!(name, "filter");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected filter call, got {other:?}"),
+        }
+        match &module.rules[1].body {
+            Expr::Call { name, args } => {
+                assert_eq!(name, "reduce");
+                assert_eq!(args.len(), 3);
+            }
+            other => panic!("expected reduce call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_ops_parse() {
+        let src = r#"
+        (module
+          (define (merged a b) (union (backlinks a) (backlinks b)))
+          (define (has n m) (contains? (backlinks n) m))
+          (define (unique n) (dedup (backlinks n))))
+        "#;
+        let module = parse_module(src).expect("should parse");
+        assert_eq!(module.rules.len(), 3);
+        for (rule, expected_name) in module.rules.iter().zip(&["union", "contains?", "dedup"]) {
+            match &rule.body {
+                Expr::Call { name, .. } => assert_eq!(name.as_str(), *expected_name),
+                other => panic!("expected call, got {other:?}"),
+            }
         }
     }
 }

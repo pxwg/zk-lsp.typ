@@ -41,6 +41,10 @@ pub struct WorkspaceSnapshot {
     pub note_checkboxes: HashMap<NoteId, Vec<CheckboxId>>,
     /// Checkbox id → direct child checkbox IDs in source order.
     pub checkbox_children: HashMap<CheckboxId, Vec<CheckboxId>>,
+    /// Note id → list of note IDs that reference this note via @ID ref items (backlinks).
+    pub note_backlinks: HashMap<NoteId, Vec<NoteId>>,
+    /// Checkbox id → parent checkbox id (absent for root-level items).
+    pub checkbox_parent: HashMap<CheckboxId, CheckboxId>,
     /// Config-driven default values for known metadata fields.
     pub metadata_defaults: HashMap<String, Value>,
 }
@@ -95,6 +99,17 @@ impl WorkspaceSnapshot {
             .unwrap_or(&[])
     }
 
+    pub fn backlinks(&self, note_id: &NoteId) -> &[NoteId] {
+        self.note_backlinks
+            .get(note_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn parent(&self, id: &CheckboxId) -> Option<&CheckboxId> {
+        self.checkbox_parent.get(id)
+    }
+
     pub fn all_note_ids(&self) -> impl Iterator<Item = &NoteId> {
         self.notes.keys()
     }
@@ -126,6 +141,7 @@ impl WorkspaceSnapshot {
         let mut checkboxes: HashMap<CheckboxId, CheckboxObs> = HashMap::new();
         let mut note_checkboxes: HashMap<NoteId, Vec<CheckboxId>> = HashMap::new();
         let mut checkbox_children: HashMap<CheckboxId, Vec<CheckboxId>> = HashMap::new();
+        let mut checkbox_parent: HashMap<CheckboxId, CheckboxId> = HashMap::new();
         let metadata_kinds = metadata_kind_map(metadata_fields);
         let metadata_defaults = metadata_default_map(metadata_fields);
 
@@ -183,6 +199,7 @@ impl WorkspaceSnapshot {
                         .entry(parent_id.clone())
                         .or_default()
                         .push(cid.clone());
+                    checkbox_parent.insert(cid.clone(), parent_id.clone());
                 }
                 checkbox_children.entry(cid.clone()).or_default();
                 stack.push((item.indent, cid.clone()));
@@ -192,11 +209,33 @@ impl WorkspaceSnapshot {
             note_checkboxes.insert(id.clone(), checkbox_ids);
         }
 
+        // Build reverse backlink index: for each ref item @target, record source → target backlink.
+        let mut note_backlinks: HashMap<NoteId, Vec<NoteId>> =
+            notes.keys().map(|id| (id.clone(), Vec::new())).collect();
+        for (id, cids) in &note_checkboxes {
+            for cid in cids {
+                if let Some(obs) = checkboxes.get(cid) {
+                    for target in &obs.targets {
+                        note_backlinks
+                            .entry(target.clone())
+                            .or_default()
+                            .push(id.clone());
+                    }
+                }
+            }
+        }
+        for backlinks in note_backlinks.values_mut() {
+            backlinks.sort();
+            backlinks.dedup();
+        }
+
         WorkspaceSnapshot {
             notes: note_obs_map,
             checkboxes,
             note_checkboxes,
             checkbox_children,
+            note_backlinks,
+            checkbox_parent,
             metadata_defaults,
         }
     }
@@ -557,6 +596,44 @@ mod tests {
         let snap = single_note_snapshot("1111111111", &content);
         let status = snap.observe_meta(&"1111111111".to_string(), "checklist-status");
         assert_eq!(status, Value::Status(Status::Done));
+    }
+
+    #[test]
+    fn backlinks_populated_from_ref_items() {
+        let body_a = "- [ ] @2222222222\n";
+        let content_a = make_toml_note("A", "1111111111", "none", body_a);
+        let content_b = make_toml_note("B", "2222222222", "none", "");
+        let mut map = HashMap::new();
+        map.insert(
+            "1111111111".to_string(),
+            (PathBuf::from("1111111111.typ"), content_a),
+        );
+        map.insert(
+            "2222222222".to_string(),
+            (PathBuf::from("2222222222.typ"), content_b),
+        );
+        let snap = WorkspaceSnapshot::from_note_map(&map);
+
+        let backlinks_b = snap.backlinks(&"2222222222".to_string());
+        assert_eq!(backlinks_b, &["1111111111".to_string()]);
+
+        let backlinks_a = snap.backlinks(&"1111111111".to_string());
+        assert!(backlinks_a.is_empty());
+    }
+
+    #[test]
+    fn parent_populated_for_nested_checkboxes() {
+        let body = "- [ ] parent\n  - [x] child\n";
+        let content = make_toml_note("A", "1111111111", "none", body);
+        let snap = single_note_snapshot("1111111111", &content);
+
+        let checkboxes = snap.local_checkboxes(&"1111111111".to_string());
+        assert_eq!(checkboxes.len(), 2);
+        let parent_id = &checkboxes[0];
+        let child_id = &checkboxes[1];
+
+        assert!(snap.parent(parent_id).is_none(), "root has no parent");
+        assert_eq!(snap.parent(child_id), Some(parent_id), "child's parent");
     }
 
     #[test]
