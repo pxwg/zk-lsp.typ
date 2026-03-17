@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -19,6 +20,7 @@ pub struct ZkLspServer {
     index: Arc<NoteIndex>,
     config: Arc<RwLock<WikiConfig>>,
     cli_root: Option<std::path::PathBuf>,
+    open_documents: Arc<RwLock<HashMap<Url, String>>>,
 }
 
 impl ZkLspServer {
@@ -33,6 +35,7 @@ impl ZkLspServer {
             index,
             config,
             cli_root,
+            open_documents: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -58,6 +61,16 @@ impl ZkLspServer {
             diags.push(d);
         }
         self.client.publish_diagnostics(uri, diags, None).await;
+    }
+
+    async fn read_document(&self, uri: &Url) -> Option<String> {
+        if let Some(content) = self.open_documents.read().await.get(uri).cloned() {
+            return Some(content);
+        }
+
+        uri.to_file_path()
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
     }
 }
 
@@ -117,11 +130,36 @@ impl LanguageServer for ZkLspServer {
         let index = Arc::clone(&self.index);
         let config = Arc::clone(&self.config);
         let client = self.client.clone();
+        let open_documents = Arc::clone(&self.open_documents);
 
         tokio::spawn(async move {
             match index.rebuild_full().await {
                 Ok(n) => {
                     info!("index built: {n} notes");
+                    for (uri, content) in open_documents.read().await.iter() {
+                        let file_path = uri.to_file_path().unwrap_or_default();
+                        let mut diags = diagnostics::get_diagnostics(content, &index, uri.path());
+                        diags.extend(diagnostics::get_schema_diagnostics(content, &index));
+                        let current_config = config.read().await.clone();
+                        if let Ok(reconcile_diags) = reconcile::collect_diagnostics(
+                            &current_config,
+                            Some((&file_path, content)),
+                        )
+                        .await
+                        {
+                            diags.extend(diagnostics::get_reconcile_diagnostics(
+                                content,
+                                &file_path,
+                                &reconcile_diags,
+                            ));
+                        }
+                        if let Some(d) =
+                            diagnostics::get_orphan_diagnostic(content, uri.path(), &index)
+                        {
+                            diags.push(d);
+                        }
+                        client.publish_diagnostics(uri.clone(), diags, None).await;
+                    }
                     // Tell the client to re-request inlay hints now that the index is ready.
                     // Ask the client to re-fetch all inlay hints now that the
                     // index is populated.
@@ -147,11 +185,28 @@ impl LanguageServer for ZkLspServer {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.clone();
         let content = params.text_document.text;
+        self.open_documents
+            .write()
+            .await
+            .insert(uri.clone(), content.clone());
         // Update index for this file
         if let Ok(path) = uri.to_file_path() {
             let _ = self.index.update_file(&path).await;
         }
         self.publish_diagnostics(uri, &content).await;
+    }
+
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let uri = params.text_document.uri;
+        let initial_content = self.read_document(&uri).await.unwrap_or_default();
+        let updated_content = {
+            let mut documents = self.open_documents.write().await;
+            let content = documents.entry(uri.clone()).or_insert(initial_content);
+            apply_content_changes(content, &params.content_changes);
+            content.clone()
+        };
+
+        self.publish_diagnostics(uri, &updated_content).await;
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -168,6 +223,11 @@ impl LanguageServer for ZkLspServer {
             },
         };
 
+        self.open_documents
+            .write()
+            .await
+            .insert(uri.clone(), content.clone());
+
         // Update index
         if let Ok(path) = uri.to_file_path() {
             let _ = self.index.update_file(&path).await;
@@ -175,6 +235,12 @@ impl LanguageServer for ZkLspServer {
 
         // Publish diagnostics for the saved file
         self.publish_diagnostics(uri.clone(), &content).await;
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let uri = params.text_document.uri;
+        self.open_documents.write().await.remove(&uri);
+        self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
@@ -207,11 +273,7 @@ impl LanguageServer for ZkLspServer {
     ) -> LspResult<Option<GotoDefinitionResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let content = uri
-            .to_file_path()
-            .ok()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .unwrap_or_default();
+        let content = self.read_document(uri).await.unwrap_or_default();
 
         Ok(definition::get_definition(&content, position, &self.index)
             .map(GotoDefinitionResponse::Scalar))
@@ -224,11 +286,7 @@ impl LanguageServer for ZkLspServer {
     async fn references(&self, params: ReferenceParams) -> LspResult<Option<Vec<Location>>> {
         let uri = &params.text_document_position.text_document.uri;
         let row = params.text_document_position.position.line as usize;
-        let content = match uri
-            .to_file_path()
-            .ok()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-        {
+        let content = match self.read_document(uri).await {
             Some(c) => c,
             None => return Ok(None),
         };
@@ -243,11 +301,7 @@ impl LanguageServer for ZkLspServer {
 
     async fn code_action(&self, params: CodeActionParams) -> LspResult<Option<CodeActionResponse>> {
         let uri = &params.text_document.uri;
-        let content = uri
-            .to_file_path()
-            .ok()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .unwrap_or_default();
+        let content = self.read_document(uri).await.unwrap_or_default();
         let mut actions = code_actions::get_code_actions(uri, &params.context.diagnostics);
         actions.extend(code_actions::get_metadata_actions(
             uri,
@@ -264,11 +318,7 @@ impl LanguageServer for ZkLspServer {
     async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        let content = uri
-            .to_file_path()
-            .ok()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .unwrap_or_default();
+        let content = self.read_document(uri).await.unwrap_or_default();
         let items = completion::get_completions(&content, position, &self.index);
         Ok(if items.is_empty() {
             None
@@ -284,11 +334,7 @@ impl LanguageServer for ZkLspServer {
     async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let content = uri
-            .to_file_path()
-            .ok()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .unwrap_or_default();
+        let content = self.read_document(uri).await.unwrap_or_default();
         Ok(hover::get_hover(&content, position, &self.index))
     }
 
@@ -298,11 +344,7 @@ impl LanguageServer for ZkLspServer {
 
     async fn inlay_hint(&self, params: InlayHintParams) -> LspResult<Option<Vec<InlayHint>>> {
         let uri = &params.text_document.uri;
-        let content = match uri
-            .to_file_path()
-            .ok()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-        {
+        let content = match self.read_document(uri).await {
             Some(c) => c,
             None => return Ok(None),
         };
@@ -405,5 +447,96 @@ impl LanguageServer for ZkLspServer {
             cmd => info!("unhandled command: {cmd}"),
         }
         Ok(None)
+    }
+}
+
+fn apply_content_changes(content: &mut String, changes: &[TextDocumentContentChangeEvent]) {
+    for change in changes {
+        match change.range {
+            Some(range) => {
+                let start = position_to_byte_offset(content, range.start);
+                let end = position_to_byte_offset(content, range.end);
+                content.replace_range(start..end, &change.text);
+            }
+            None => {
+                *content = change.text.clone();
+            }
+        }
+    }
+}
+
+fn position_to_byte_offset(content: &str, position: Position) -> usize {
+    let line_start = if position.line == 0 {
+        0
+    } else {
+        match content
+            .match_indices('\n')
+            .nth(position.line.saturating_sub(1) as usize)
+            .map(|(idx, _)| idx + 1)
+        {
+            Some(offset) => offset,
+            None => content.len(),
+        }
+    };
+
+    let line_end = content[line_start..]
+        .find('\n')
+        .map(|idx| line_start + idx)
+        .unwrap_or(content.len());
+    let line = &content[line_start..line_end];
+
+    let mut utf16_units = 0u32;
+    for (byte_idx, ch) in line.char_indices() {
+        if utf16_units >= position.character {
+            return line_start + byte_idx;
+        }
+        utf16_units += ch.len_utf16() as u32;
+    }
+
+    line_end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_content_changes, position_to_byte_offset};
+    use crate::parser;
+    use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+
+    #[test]
+    fn apply_content_changes_updates_incremental_edits() {
+        let mut content = "第一行\nhello @1234567890\n".to_string();
+        apply_content_changes(
+            &mut content,
+            &[TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: 1,
+                        character: 6,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 17,
+                    },
+                }),
+                range_length: None,
+                text: "@0000000001".into(),
+            }],
+        );
+
+        assert_eq!(content, "第一行\nhello @0000000001\n");
+    }
+
+    #[test]
+    fn position_to_byte_offset_handles_utf16_columns() {
+        let content = "第一行\nab界c\n";
+        let offset = position_to_byte_offset(
+            content,
+            Position {
+                line: 1,
+                character: parser::byte_to_utf16("ab界c", "ab界".len()),
+            },
+        );
+
+        assert_eq!(&content[offset..], "c\n");
     }
 }
