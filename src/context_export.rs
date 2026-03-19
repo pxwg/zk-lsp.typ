@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::config::WikiConfig;
+use crate::note_info;
 use crate::parser::{self, ChecklistStatus, Relation};
 
 /// Export a BFS context document starting from `entry_id` to the given `depth`.
@@ -19,14 +20,10 @@ pub async fn export_context(
     entry_id: &str,
     depth: usize,
     inverse: bool,
+    simple: bool,
     config: &WikiConfig,
 ) -> anyhow::Result<String> {
-    // For inverse mode, build a reverse map: target_id → Vec<source_id>
-    let reverse_map: HashMap<String, Vec<String>> = if inverse {
-        build_reverse_map(config).await
-    } else {
-        HashMap::new()
-    };
+    let reverse_map = build_reverse_map(config).await;
 
     let mut queue: VecDeque<(String, usize)> = VecDeque::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -71,20 +68,16 @@ pub async fn export_context(
             .unwrap_or(Relation::Active);
 
         // Extract outgoing refs (filtered: skips TOML block, comments, fences)
-        let out_refs: Vec<String> = parser::find_all_refs_filtered(&content)
+        let out_refs: Vec<String> = parser::find_all_link_ids_filtered(&content)
             .into_iter()
-            .map(|r| r.id)
             .collect::<HashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+        let inbound_refs = reverse_map.get(&id).cloned().unwrap_or_default();
 
         // Enqueue unvisited neighbours if within depth
         if d < depth {
-            let neighbours: &[String] = if inverse {
-                reverse_map.get(&id).map(|v| v.as_slice()).unwrap_or(&[])
-            } else {
-                &out_refs
-            };
+            let neighbours: &[String] = if inverse { &inbound_refs } else { &out_refs };
             for ref_id in neighbours {
                 if visited.insert(ref_id.clone()) {
                     queue.push_back((ref_id.clone(), d + 1));
@@ -97,6 +90,12 @@ pub async fn export_context(
 
         let mut sorted_refs = out_refs.clone();
         sorted_refs.sort();
+        let note_info = header.as_ref().map(|h| {
+            let parsed_toml = parser::find_toml_metadata_block(&content)
+                .and_then(|b| parser::parse_toml_metadata(&b.toml_content))
+                .unwrap_or_default();
+            note_info::build_note_info_value(&id, &path, h, &parsed_toml)
+        });
 
         sections.push(NoteSection {
             id: id.clone(),
@@ -106,7 +105,9 @@ pub async fn export_context(
             checklist_status,
             relation,
             out_refs: sorted_refs,
+            inbound_refs,
             body,
+            note_info,
         });
     }
 
@@ -121,6 +122,15 @@ pub async fn export_context(
         sections.first().map(|s| s.title.as_str()).unwrap_or("")
     };
     let today = chrono_today();
+    let section_ids: HashSet<String> = sections.iter().map(|s| s.id.clone()).collect();
+
+    if simple {
+        let items = sections
+            .iter()
+            .filter_map(|s| s.note_info.clone())
+            .collect::<Vec<_>>();
+        return Ok(serde_json::to_string_pretty(&items)?);
+    }
 
     let mut out = String::new();
     if inverse {
@@ -162,6 +172,23 @@ pub async fn export_context(
             out.push_str(&format!("**Outgoing links:** {refs_str}\n"));
         }
 
+        let mut local_inbound = section
+            .inbound_refs
+            .iter()
+            .filter(|id| section_ids.contains(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        local_inbound.sort();
+        local_inbound.dedup();
+        if !local_inbound.is_empty() {
+            let refs_str = local_inbound
+                .iter()
+                .map(|r| format!("@{r}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("**Referenced by:** {refs_str}\n"));
+        }
+
         out.push('\n');
 
         if !section.body.is_empty() {
@@ -183,7 +210,9 @@ struct NoteSection {
     checklist_status: ChecklistStatus,
     relation: Relation,
     out_refs: Vec<String>,
+    inbound_refs: Vec<String>,
     body: String,
+    note_info: Option<serde_json::Value>,
 }
 
 /// Build a reverse map: target_id → Vec<source_id> by scanning all .typ files.
@@ -212,8 +241,8 @@ async fn build_reverse_map(config: &WikiConfig) -> HashMap<String, Vec<String>> 
             Ok(c) => c,
             Err(_) => continue,
         };
-        for r in parser::find_all_refs_filtered(&content) {
-            map.entry(r.id).or_default().push(source_id.clone());
+        for id in parser::find_all_link_ids_filtered(&content) {
+            map.entry(id).or_default().push(source_id.clone());
         }
     }
     map
@@ -310,7 +339,7 @@ mod tests {
         let tmp = make_test_dir("single");
         write_note(&tmp.join("note"), "1111111111", "Entry Note", &[]);
         let config = WikiConfig::from_root(tmp.clone());
-        let out = export_context("1111111111", 0, false, &config)
+        let out = export_context("1111111111", 0, false, false, &config)
             .await
             .unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
@@ -330,7 +359,7 @@ mod tests {
         );
         write_note(&tmp.join("note"), "2222222222", "Linked Note", &[]);
         let config = WikiConfig::from_root(tmp.clone());
-        let out = export_context("1111111111", 1, false, &config)
+        let out = export_context("1111111111", 1, false, false, &config)
             .await
             .unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
@@ -338,5 +367,121 @@ mod tests {
         assert!(out.contains("Entry Note"));
         assert!(out.contains("2222222222"));
         assert!(out.contains("Linked Note"));
+    }
+
+    #[tokio::test]
+    async fn test_export_bfs_depth_with_angle_link() {
+        let tmp = make_test_dir("angle_outgoing");
+        let content = concat!(
+            "#import \"../include.typ\": *\n",
+            "#let zk-metadata = toml(bytes(\"\"\"\n",
+            "```toml\n",
+            "schema-version = 1\n",
+            "title = \"Entry Note\"\n",
+            "tags = []\n",
+            "checklist-status = \"none\"\n",
+            "relation = \"active\"\n",
+            "relation-target = []\n",
+            "generated = false\n",
+            "```\n",
+            "\"\"\"))\n",
+            "#show: zettel\n",
+            "\n",
+            "= Entry Note <1111111111>\n",
+            "See predecessor <2222222222>\n",
+        );
+        std::fs::write(tmp.join("note/1111111111.typ"), content).unwrap();
+        write_note(&tmp.join("note"), "2222222222", "Linked Note", &[]);
+
+        let config = WikiConfig::from_root(tmp.clone());
+        let out = export_context("1111111111", 1, false, false, &config)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(out.contains("1111111111"));
+        assert!(out.contains("2222222222"));
+        assert!(out.contains("**Outgoing links:** @2222222222"));
+    }
+
+    #[tokio::test]
+    async fn test_export_inverse_with_angle_link() {
+        let tmp = make_test_dir("angle_inverse");
+        write_note(&tmp.join("note"), "1111111111", "Entry Note", &[]);
+        let content = concat!(
+            "#import \"../include.typ\": *\n",
+            "#let zk-metadata = toml(bytes(\"\"\"\n",
+            "```toml\n",
+            "schema-version = 1\n",
+            "title = \"Parent Note\"\n",
+            "tags = []\n",
+            "checklist-status = \"none\"\n",
+            "relation = \"active\"\n",
+            "relation-target = []\n",
+            "generated = false\n",
+            "```\n",
+            "\"\"\"))\n",
+            "#show: zettel\n",
+            "\n",
+            "= Parent Note <2222222222>\n",
+            "Depends on <1111111111>\n",
+        );
+        std::fs::write(tmp.join("note/2222222222.typ"), content).unwrap();
+
+        let config = WikiConfig::from_root(tmp.clone());
+        let out = export_context("1111111111", 1, true, false, &config)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let parent_pos = out.find("## 2222222222 · Parent Note").unwrap();
+        let entry_pos = out.find("## 1111111111 · Entry Note").unwrap();
+        assert!(parent_pos < entry_pos);
+    }
+
+    #[tokio::test]
+    async fn test_export_section_shows_local_referenced_by() {
+        let tmp = make_test_dir("incoming_local_graph");
+        write_note(
+            &tmp.join("note"),
+            "1111111111",
+            "Entry Note",
+            &["2222222222", "3333333333"],
+        );
+        write_note(&tmp.join("note"), "2222222222", "Child A", &["3333333333"]);
+        write_note(&tmp.join("note"), "3333333333", "Child B", &[]);
+
+        let config = WikiConfig::from_root(tmp.clone());
+        let out = export_context("1111111111", 1, false, false, &config)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(out.contains("**Referenced by:** @1111111111, @2222222222"));
+    }
+
+    #[tokio::test]
+    async fn test_export_simple_outputs_note_info_array() {
+        let tmp = make_test_dir("simple_mode");
+        write_note(
+            &tmp.join("note"),
+            "1111111111",
+            "Entry Note",
+            &["2222222222"],
+        );
+        write_note(&tmp.join("note"), "2222222222", "Linked Note", &[]);
+
+        let config = WikiConfig::from_root(tmp.clone());
+        let out = export_context("1111111111", 1, false, true, &config)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let items: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let arr = items.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], "1111111111");
+        assert_eq!(arr[0]["title"], "Entry Note");
+        assert_eq!(arr[1]["id"], "2222222222");
     }
 }

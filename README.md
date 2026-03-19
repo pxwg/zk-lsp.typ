@@ -124,7 +124,7 @@ Commands:
   format     Read a note from stdin, write formatted content to stdout
   migrate    Migrate legacy comment-format notes to TOML schema v1
   reconcile  Reconcile cross-file checkbox states [--dry-run]
-  export     BFS context export for AI consumption [--depth N] [--inverse]
+  export     BFS context export for AI consumption [--depth N] [--inverse] [--simple]
   check      Graph integrity check: dead links + orphan notes
   note-info  Output a single note's metadata as JSON
 
@@ -153,6 +153,9 @@ zk-lsp export 2602082037 --depth 2
 
 # Export context (ancestors first — "what led to this idea?")
 zk-lsp export 2602082037 --depth 2 --inverse
+
+# Export only related note-info JSON objects
+zk-lsp export 2602082037 --depth 2 --simple
 
 # Check graph integrity (exits 1 on dead links)
 zk-lsp check
@@ -243,7 +246,7 @@ See [docs/reconcile-dsl.md](docs/reconcile-dsl.md) for the DSL reference and exa
 | `zk.newNote` | — | Create a note and notify with its URI |
 | `zk.removeNote` | `id: string` | Delete a note |
 | `zk.generateLinkTyp` | — | Regenerate `link.typ` |
-| `zk.exportContext` | `id: string, depth?: number, inverse?: bool` | Return Markdown context |
+| `zk.exportContext` | `id: string, depth?: number, inverse?: bool, simple?: bool` | Return Markdown context or simple note-info JSON |
 
 ## Diagnostics
 

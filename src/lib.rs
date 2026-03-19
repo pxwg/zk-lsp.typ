@@ -76,6 +76,8 @@ pub mod link_gen;
 #[doc(hidden)]
 pub mod migrate;
 #[doc(hidden)]
+pub mod note_info;
+#[doc(hidden)]
 pub mod note_ops;
 #[doc(hidden)]
 pub mod parser;

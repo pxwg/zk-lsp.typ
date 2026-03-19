@@ -11,6 +11,7 @@ mod index;
 mod init;
 mod link_gen;
 mod migrate;
+mod note_info;
 mod note_ops;
 mod parser;
 mod reconcile;
@@ -92,8 +93,13 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         },
-        Command::Export { id, depth, inverse } => {
-            let out = context_export::export_context(&id, depth, inverse, &config).await?;
+        Command::Export {
+            id,
+            depth,
+            inverse,
+            simple,
+        } => {
+            let out = context_export::export_context(&id, depth, inverse, simple, &config).await?;
             print!("{out}");
         }
         Command::Init => unreachable!("handled above"),
@@ -132,76 +138,11 @@ async fn main() -> anyhow::Result<()> {
             let parsed_toml = parser::find_toml_metadata_block(&content)
                 .and_then(|b| parser::parse_toml_metadata(&b.toml_content))
                 .unwrap_or_default();
-            let json = build_note_info_json(&id, &path, &header, &parsed_toml)?;
+            let json = note_info::build_note_info_json(&id, &path, &header, &parsed_toml)?;
             println!("{json}");
         }
     }
     Ok(())
-}
-
-fn toml_value_to_json(v: &toml::Value) -> serde_json::Value {
-    match v {
-        toml::Value::String(s) => serde_json::Value::String(s.clone()),
-        toml::Value::Integer(n) => serde_json::Value::Number((*n).into()),
-        toml::Value::Float(f) => serde_json::Number::from_f64(*f)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
-        toml::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(toml_value_to_json).collect())
-        }
-        toml::Value::Table(t) => {
-            let map: serde_json::Map<String, serde_json::Value> = t
-                .iter()
-                .map(|(k, v)| (k.clone(), toml_value_to_json(v)))
-                .collect();
-            serde_json::Value::Object(map)
-        }
-        toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
-    }
-}
-
-fn build_note_info_json(
-    id: &str,
-    path: &std::path::Path,
-    header: &parser::NoteHeader,
-    parsed: &parser::ParsedToml,
-) -> anyhow::Result<String> {
-    use serde_json::{json, Map, Value};
-
-    let checklist_status_str = parsed.checklist_status.as_str();
-    let relation_str = match parsed.relation {
-        parser::Relation::Active => "active",
-        parser::Relation::Archived => "archived",
-        parser::Relation::Legacy => "legacy",
-    };
-
-    let mut metadata: Map<String, Value> = Map::new();
-    metadata.insert("schema-version".into(), json!(parsed.schema_version));
-    metadata.insert("aliases".into(), json!(parsed.aliases));
-    metadata.insert(
-        "abstract".into(),
-        json!(parsed.abstract_text.as_deref().unwrap_or("")),
-    );
-    metadata.insert("keywords".into(), json!(parsed.keywords));
-    metadata.insert("generated".into(), json!(parsed.generated));
-    metadata.insert("checklist-status".into(), json!(checklist_status_str));
-    metadata.insert("relation".into(), json!(relation_str));
-    metadata.insert("relation-target".into(), json!(parsed.relation_target));
-
-    // Merge extra (non-core) fields
-    for (k, v) in &parsed.extra {
-        metadata.insert(k.clone(), toml_value_to_json(v));
-    }
-
-    let output = json!({
-        "id": id,
-        "path": path.to_string_lossy().as_ref(),
-        "title": header.title,
-        "metadata": Value::Object(metadata),
-    });
-
-    Ok(serde_json::to_string_pretty(&output)?)
 }
 
 async fn run_lsp(cli_root: Option<std::path::PathBuf>) -> anyhow::Result<()> {

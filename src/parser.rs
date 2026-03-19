@@ -3,6 +3,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 
 pub(crate) static RE_ID_REF: Lazy<Regex> = Lazy::new(|| Regex::new(r"@(\d{10})").unwrap());
+pub(crate) static RE_ANGLE_ID: Lazy<Regex> = Lazy::new(|| Regex::new(r"<(\d{10})>").unwrap());
 pub(crate) static RE_TITLE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^=\s+.*<(\d{10})>").unwrap());
 pub(crate) static RE_EVO: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"#evolution_link\s*\(\s*<(\d{10})>\s*\)").unwrap());
@@ -469,6 +470,31 @@ pub fn byte_to_utf16(s: &str, byte_offset: usize) -> u32 {
     s[..byte_offset].chars().map(|c| c.len_utf16() as u32).sum()
 }
 
+pub fn extract_angle_id(line: &str) -> Option<String> {
+    let start = line.rfind('<')?;
+    let end = line[start..].find('>')? + start;
+    let candidate = &line[start + 1..end];
+    if candidate.len() == 10 && candidate.chars().all(|c| c.is_ascii_digit()) {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
+pub fn extract_at_id(line: &str) -> Option<String> {
+    let at = line.find('@')?;
+    let rest = &line[at + 1..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let candidate = &rest[..end];
+    if candidate.len() == 10 {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
 /// Find all @ID occurrences in content (10-digit IDs).
 /// `start_char` / `end_char` are **byte** offsets within the line (not UTF-16).
 /// Convert with `byte_to_utf16` before using as LSP character positions.
@@ -597,6 +623,94 @@ pub fn find_all_refs_filtered(content: &str) -> Vec<RefOccurrence> {
     }
 
     refs
+}
+
+/// Find all link target IDs in content, combining both `@ID` and `<ID>` forms,
+/// while skipping TOML metadata blocks, block comments, and fenced code blocks.
+///
+/// The note's own title ID (`= Title <ID>`) is excluded to avoid treating the
+/// note header as a self-link.
+pub fn find_all_link_ids_filtered(content: &str) -> Vec<String> {
+    let self_id = parse_header(content).map(|h| h.id);
+    let mut ids: Vec<String> = find_all_refs_filtered(content)
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+
+    let toml_range = find_toml_metadata_block(content).map(|b| b.start_line..=b.end_line);
+    let mut in_block_comment = false;
+    let mut in_fence = false;
+
+    for (line_num, line) in content.lines().enumerate() {
+        if let Some(ref range) = toml_range {
+            if range.contains(&line_num) {
+                continue;
+            }
+        }
+
+        let mut visible_segments = Vec::new();
+        let mut pos = 0usize;
+        loop {
+            if in_block_comment {
+                let Some(end_offset) = line[pos..].find("*/") else {
+                    break;
+                };
+                in_block_comment = false;
+                pos += end_offset + 2;
+                continue;
+            }
+
+            let trimmed = line[pos..].trim_start();
+            if pos == 0 && trimmed.starts_with("```") {
+                in_fence = !in_fence;
+                break;
+            }
+            if in_fence {
+                break;
+            }
+
+            let remaining = &line[pos..];
+            let bc_start = remaining.find("/*");
+            let fence_start = remaining.find("```");
+            let next_cut = match (bc_start, fence_start) {
+                (Some(bc), Some(fence)) => Some(bc.min(fence)),
+                (Some(bc), None) => Some(bc),
+                (None, Some(fence)) => Some(fence),
+                (None, None) => None,
+            };
+
+            match next_cut {
+                Some(offset) => {
+                    visible_segments.push((pos, pos + offset));
+                    let abs = pos + offset;
+                    if remaining[offset..].starts_with("/*") {
+                        in_block_comment = true;
+                        pos = abs + 2;
+                    } else {
+                        in_fence = true;
+                        break;
+                    }
+                }
+                None => {
+                    visible_segments.push((pos, line.len()));
+                    break;
+                }
+            }
+        }
+
+        for (seg_start, seg_end) in visible_segments {
+            let segment = &line[seg_start..seg_end];
+            for cap in RE_ANGLE_ID.captures_iter(segment) {
+                let id = cap.get(1).unwrap().as_str();
+                if self_id.as_deref() == Some(id) {
+                    continue;
+                }
+                ids.push(id.to_string());
+            }
+        }
+    }
+
+    ids
 }
 
 /// A heading parsed from note content (outside TOML block and fenced code).

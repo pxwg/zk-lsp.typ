@@ -46,6 +46,9 @@ pub enum Command {
         /// Traverse inbound links instead of outgoing; output ancestors first, entry last
         #[arg(long, default_value_t = false)]
         inverse: bool,
+        /// Output only related note-info JSON, without rendered note bodies
+        #[arg(long, default_value_t = false)]
+        simple: bool,
     },
     /// Check graph integrity: dead links and orphan notes
     Check {
