@@ -163,8 +163,65 @@ mod tests {
         assert!(validate_note_id("YYMMDDHHMM").is_err());
         assert!(validate_note_id("2602110128 ").is_err());
     }
-    use crate::config::{MetadataConfig, MetadataFieldConfig, MetadataFieldKind, ZkLspConfig};
+    use crate::config::{
+        MetadataConfig, MetadataFieldConfig, MetadataFieldKind, WikiConfig, ZkLspConfig,
+    };
     use crate::parser;
+
+    fn make_test_wiki(suffix: &str) -> (WikiConfig, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("zk_note_ops_test_{suffix}"));
+        let config = WikiConfig::from_root(root.clone());
+        (config, root)
+    }
+
+    #[tokio::test]
+    async fn test_create_note_custom_id_produces_correct_filename() {
+        let (config, _root) = make_test_wiki("custom_id_filename");
+        let custom_id = "2602110128".to_string();
+        let path = create_note(&config, Some(custom_id.clone())).await.unwrap();
+        assert_eq!(
+            path.file_name().unwrap(),
+            std::ffi::OsStr::new(&format!("{custom_id}.typ"))
+        );
+        assert!(path.exists(), "created note file must exist on disk");
+    }
+
+    #[tokio::test]
+    async fn test_create_note_custom_id_content_contains_id() {
+        let (config, _root) = make_test_wiki("custom_id_content");
+        let custom_id = "2602110129".to_string();
+        let path = create_note(&config, Some(custom_id.clone())).await.unwrap();
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            content.contains(&custom_id),
+            "note content must reference the custom ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_note_invalid_id_is_rejected() {
+        let (config, _root) = make_test_wiki("invalid_id");
+        let err = create_note(&config, Some("badid".to_string()))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid note ID"),
+            "error message should mention invalid note ID, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_note_no_id_generates_file() {
+        let (config, _root) = make_test_wiki("auto_id");
+        let path = create_note(&config, None).await.unwrap();
+        assert!(path.exists(), "auto-generated note file must exist on disk");
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.len() == 14 && name.ends_with(".typ"),
+            "filename should be 10-digit ID + .typ, got: {name}"
+        );
+    }
 
     fn config_with_fields(fields: Vec<MetadataFieldConfig>) -> ZkLspConfig {
         ZkLspConfig {

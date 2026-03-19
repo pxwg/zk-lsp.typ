@@ -42,12 +42,13 @@ async fn main() -> anyhow::Result<()> {
 
     // `init` defaults to $PWD, not ~/wiki, so resolve its config before the
     // shared config (which defaults to ~/wiki for everything else).
-    if matches!(cli.command, Some(Command::Init)) {
+    if let Some(Command::Init { id }) = &cli.command {
+        let id = id.clone();
         let root = cli.wiki_root.clone().unwrap_or_else(|| {
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
         });
         let config = WikiConfig::from_root(root);
-        return init::init_wiki(&config).await;
+        return init::init_wiki(&config, id).await;
     }
 
     let config = std::sync::Arc::new(WikiConfig::resolve(cli.wiki_root.clone(), None));
@@ -102,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
             let out = context_export::export_context(&id, depth, inverse, simple, &config).await?;
             print!("{out}");
         }
-        Command::Init => unreachable!("handled above"),
+        Command::Init { .. } => unreachable!("handled above"),
         Command::Check {
             no_orphans,
             no_dead_links,

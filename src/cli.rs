@@ -64,7 +64,11 @@ pub enum Command {
         no_dead_links: bool,
     },
     /// Initialise a new wiki in the current directory (or --wiki-root)
-    Init,
+    Init {
+        /// Custom 10-digit note ID (YYMMDDHHMM) for the sample note; defaults to current timestamp
+        #[arg(long)]
+        id: Option<String>,
+    },
     /// Output a single note's metadata as JSON
     NoteInfo {
         /// The 10-digit note ID (YYMMDDHHMM)

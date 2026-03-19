@@ -48,7 +48,7 @@ const GITIGNORE: &str = "*.pdf\n";
 ///   3. Write `.gitignore`.
 ///   4. `git init` (if git is available; non-fatal on failure).
 ///   5. Create one sample note via `note_ops::create_note`.
-pub async fn init_wiki(config: &WikiConfig) -> Result<()> {
+pub async fn init_wiki(config: &WikiConfig, sample_note_id: Option<String>) -> Result<()> {
     let root = &config.root;
 
     // 1. Directories
@@ -117,7 +117,7 @@ pub async fn init_wiki(config: &WikiConfig) -> Result<()> {
     }
 
     // 5. Sample note
-    let note_path = note_ops::create_note(config, None).await?;
+    let note_path = note_ops::create_note(config, sample_note_id).await?;
     eprintln!("  created  {}", note_path.display());
 
     eprintln!("\nWiki initialised at {}", root.display());
