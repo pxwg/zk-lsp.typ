@@ -10,7 +10,7 @@
 (module
   (policy
     (cycle error)
-    (unknown-status todo))
+    (unknown-status none))
 
   ;; Which metadata fields are materialized back to notes.
   (define (materialized_fields n)

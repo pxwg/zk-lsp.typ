@@ -9,12 +9,35 @@ pub(crate) static RE_EVO: Lazy<Regex> =
 pub(crate) static RE_ALT: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"#alternative_link\s*\(\s*<(\d{10})>\s*\)").unwrap());
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChecklistStatus {
     None,
     Todo,
     Wip,
     Done,
+}
+
+impl ChecklistStatus {
+    pub const ALL: [Self; 4] = [Self::None, Self::Todo, Self::Wip, Self::Done];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Todo => "todo",
+            Self::Wip => "wip",
+            Self::Done => "done",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "todo" => Some(Self::Todo),
+            "wip" => Some(Self::Wip),
+            "done" => Some(Self::Done),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -183,12 +206,7 @@ pub fn parse_toml_metadata(toml_str: &str) -> Option<ParsedToml> {
     let checklist_status = table
         .get("checklist-status")
         .and_then(|v| v.as_str())
-        .map(|s| match s {
-            "todo" => ChecklistStatus::Todo,
-            "wip" => ChecklistStatus::Wip,
-            "done" => ChecklistStatus::Done,
-            _ => ChecklistStatus::None,
-        })
+        .and_then(ChecklistStatus::from_str)
         .unwrap_or(ChecklistStatus::None);
 
     let relation = table
@@ -756,6 +774,13 @@ pub(crate) mod tests {
         let s = count_todos(content);
         assert_eq!(s.incomplete, 1);
         assert_eq!(s.completed, 2);
+    }
+
+    #[test]
+    fn test_checklist_status_roundtrip() {
+        for status in ChecklistStatus::ALL {
+            assert_eq!(ChecklistStatus::from_str(status.as_str()), Some(status));
+        }
     }
 
     #[test]

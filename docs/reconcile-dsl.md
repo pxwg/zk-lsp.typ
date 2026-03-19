@@ -48,7 +48,7 @@ Every rule file must contain a single `(module ...)` form:
   ;; Optional policy block
   (policy
     (cycle error)          ;; "error" (default) — abort on cycles
-    (unknown-status todo)) ;; default status when observation is missing
+    (unknown-status none)) ;; default status when observation is missing
 
   ;; Required: which fields to write back
   (define (materialized_fields n)
@@ -105,7 +105,7 @@ in rule signatures are:
 
 | Builtin | Signature | Description |
 |---------|-----------|-------------|
-| `aggregate_status(xs)` | `List(Status) → Status` | `done` if all done; `todo` if all todo; `wip` otherwise |
+| `aggregate_status(xs)` | `List(Status) → Status` | Ignores `none` when any concrete status exists; returns `none` only when all inputs are `none` or the list is empty |
 | `done?` / `todo?` / `wip?` / `none?` | `Status → Bool` | Status predicates |
 | `all_done(xs)` | `List(Status) → Bool` | True iff every element is `done` |
 
@@ -195,7 +195,7 @@ ships with the binary:
 (module
   (policy
     (cycle error)
-    (unknown-status todo))
+    (unknown-status none))
 
   (define (materialized_fields n)
     (list "checklist-status"))
@@ -247,7 +247,7 @@ to it.  Demonstrates: graph queries, numeric comparisons, custom fields.
 ```lisp
 ;; examples/rules/backlink_verified.lisp
 (module
-  (policy (cycle error) (unknown-status todo))
+  (policy (cycle error) (unknown-status none))
 
   (define (materialized_fields n)
     (list "checklist-status" "user.verified"))

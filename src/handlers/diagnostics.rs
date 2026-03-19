@@ -242,7 +242,7 @@ pub fn get_schema_diagnostics(content: &str, index: &Arc<NoteIndex>) -> Vec<Diag
 
         if trimmed.starts_with("checklist-status") {
             if let Some(val) = extract_toml_string_value(trimmed) {
-                if !["none", "todo", "wip", "done"].contains(&val) {
+                if crate::parser::ChecklistStatus::from_str(val).is_none() {
                     diagnostics.push(Diagnostic {
                         range: line_range,
                         severity: Some(DiagnosticSeverity::ERROR),

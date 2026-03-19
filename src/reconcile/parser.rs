@@ -257,15 +257,12 @@ fn parse_policy(p: &mut Parser) -> Result<Policy, ParseError> {
                             })
                         }
                     },
-                    "unknown-status" => match value.as_str() {
-                        "none" => policy.unknown_status = Status::None,
-                        "todo" => policy.unknown_status = Status::Todo,
-                        "wip" => policy.unknown_status = Status::Wip,
-                        "done" => policy.unknown_status = Status::Done,
-                        v => {
+                    "unknown-status" => match Status::from_str(&value) {
+                        Some(status) => policy.unknown_status = status,
+                        None => {
                             return Err(ParseError::InvalidPolicyValue {
                                 key: "unknown-status".to_string(),
-                                value: v.to_string(),
+                                value,
                             })
                         }
                     },
@@ -333,12 +330,8 @@ fn parse_expr(p: &mut Parser) -> Result<Expr, ParseError> {
                 return Ok(Expr::Lit(Value::Bool(false)));
             }
             // status literals
-            match s.as_str() {
-                "none" => return Ok(Expr::Lit(Value::Status(Status::None))),
-                "todo" => return Ok(Expr::Lit(Value::Status(Status::Todo))),
-                "wip" => return Ok(Expr::Lit(Value::Status(Status::Wip))),
-                "done" => return Ok(Expr::Lit(Value::Status(Status::Done))),
-                _ => {}
+            if let Some(status) = Status::from_str(&s) {
+                return Ok(Expr::Lit(Value::Status(status)));
             }
             // numeric literals
             if let Ok(n) = s.parse::<i64>() {
@@ -444,6 +437,17 @@ mod tests {
     }
 
     #[test]
+    fn policy_accepts_none_status() {
+        let src = r#"
+        (module
+            (policy
+            (unknown-status none)))
+        "#;
+        let module = parse_module(src).expect("should parse");
+        assert_eq!(module.policy.unknown_status, Status::None);
+    }
+
+    #[test]
     fn define_params() {
         let src = r#"
         (module
@@ -483,7 +487,7 @@ mod tests {
         assert_eq!(module.rules.len(), 0);
         // Default policy
         assert_eq!(module.policy.cycle, CyclePolicy::Error);
-        assert_eq!(module.policy.unknown_status, Status::Todo);
+        assert_eq!(module.policy.unknown_status, Status::None);
     }
 
     #[test]

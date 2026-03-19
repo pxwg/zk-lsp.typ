@@ -608,16 +608,7 @@ fn status_predicate(
 }
 
 fn aggregate_status(statuses: &[Status]) -> Status {
-    if statuses.is_empty() {
-        return Status::None;
-    }
-    if statuses.iter().all(|status| *status == Status::Done) {
-        return Status::Done;
-    }
-    if statuses.iter().all(|status| *status == Status::Todo) {
-        return Status::Todo;
-    }
-    Status::Wip
+    Status::aggregate(statuses)
 }
 
 #[allow(dead_code)]
@@ -871,6 +862,30 @@ mod tests {
         assert_eq!(
             checklist_status_field(&result, "1111111111"),
             Some(Status::Done)
+        );
+    }
+
+    #[test]
+    fn aggregate_status_preserves_all_none() {
+        assert_eq!(
+            aggregate_status(&[Status::None, Status::None]),
+            Status::None
+        );
+    }
+
+    #[test]
+    fn aggregate_status_ignores_none_when_other_statuses_exist() {
+        assert_eq!(
+            aggregate_status(&[Status::None, Status::Todo]),
+            Status::Todo
+        );
+        assert_eq!(
+            aggregate_status(&[Status::None, Status::Done]),
+            Status::Done
+        );
+        assert_eq!(
+            aggregate_status(&[Status::None, Status::Todo, Status::Done]),
+            Status::Wip
         );
     }
 

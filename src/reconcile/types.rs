@@ -35,7 +35,7 @@ impl fmt::Display for CheckboxId {
 /// Note / checklist status values used throughout the DSL.
 ///
 /// Maps to the `checklist-status` TOML field and to the `Status` DSL type.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Status {
     /// No checklist — status not applicable.
     None,
@@ -50,16 +50,45 @@ pub enum Status {
 impl Status {
     #[allow(dead_code)]
     pub fn is_done(&self) -> bool {
-        matches!(self, Status::Done)
+        matches!(self, Self::Done)
     }
 
     pub fn to_str(&self) -> &'static str {
         match self {
-            Status::None => "none",
-            Status::Todo => "todo",
-            Status::Wip => "wip",
-            Status::Done => "done",
+            Self::None => "none",
+            Self::Todo => "todo",
+            Self::Wip => "wip",
+            Self::Done => "done",
         }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "todo" => Some(Self::Todo),
+            "wip" => Some(Self::Wip),
+            "done" => Some(Self::Done),
+            _ => None,
+        }
+    }
+
+    pub fn aggregate(statuses: &[Self]) -> Self {
+        let applicable: Vec<Self> = statuses
+            .iter()
+            .copied()
+            .filter(|status| *status != Self::None)
+            .collect();
+
+        if applicable.is_empty() {
+            return Self::None;
+        }
+        if applicable.iter().all(|status| *status == Self::Done) {
+            return Self::Done;
+        }
+        if applicable.iter().all(|status| *status == Self::Todo) {
+            return Self::Todo;
+        }
+        Self::Wip
     }
 }
 

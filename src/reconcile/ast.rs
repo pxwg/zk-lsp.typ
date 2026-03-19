@@ -18,7 +18,7 @@ impl Default for Policy {
     fn default() -> Self {
         Policy {
             cycle: CyclePolicy::Error,
-            unknown_status: Status::Todo,
+            unknown_status: Status::None,
         }
     }
 }

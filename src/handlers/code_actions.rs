@@ -102,13 +102,8 @@ pub fn get_metadata_actions(uri: &Url, content: &str, range: Range) -> Vec<CodeA
     let mut actions = Vec::new();
 
     // --- Action A: Toggle checklist-status ---
-    let current_status = match parsed.checklist_status {
-        parser::ChecklistStatus::None => "none",
-        parser::ChecklistStatus::Todo => "todo",
-        parser::ChecklistStatus::Wip => "wip",
-        parser::ChecklistStatus::Done => "done",
-    };
-    for new_status in ["none", "todo", "wip", "done"] {
+    let current_status = parsed.checklist_status.as_str();
+    for new_status in parser::ChecklistStatus::ALL.map(parser::ChecklistStatus::as_str) {
         if new_status == current_status {
             continue;
         }

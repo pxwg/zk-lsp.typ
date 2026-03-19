@@ -144,12 +144,7 @@ pub async fn export_context(
             out.push_str(&format!("**Keywords:** {}\n", section.keywords.join(", ")));
         }
 
-        let cs = match section.checklist_status {
-            ChecklistStatus::None => "none",
-            ChecklistStatus::Todo => "todo",
-            ChecklistStatus::Wip => "wip",
-            ChecklistStatus::Done => "done",
-        };
+        let cs = section.checklist_status.as_str();
         let rel = match section.relation {
             Relation::Active => "active",
             Relation::Archived => "archived",

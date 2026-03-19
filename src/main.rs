@@ -169,12 +169,7 @@ fn build_note_info_json(
 ) -> anyhow::Result<String> {
     use serde_json::{json, Map, Value};
 
-    let checklist_status_str = match parsed.checklist_status {
-        parser::ChecklistStatus::None => "none",
-        parser::ChecklistStatus::Todo => "todo",
-        parser::ChecklistStatus::Wip => "wip",
-        parser::ChecklistStatus::Done => "done",
-    };
+    let checklist_status_str = parsed.checklist_status.as_str();
     let relation_str = match parsed.relation {
         parser::Relation::Active => "active",
         parser::Relation::Archived => "archived",

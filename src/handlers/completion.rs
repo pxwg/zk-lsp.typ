@@ -32,7 +32,8 @@ pub fn get_completions(
     let trimmed = current_line.trim_start();
 
     if trimmed.starts_with("checklist-status") && trimmed.contains('"') {
-        return ["none", "todo", "wip", "done"]
+        return crate::parser::ChecklistStatus::ALL
+            .map(crate::parser::ChecklistStatus::as_str)
             .iter()
             .map(|val| CompletionItem {
                 label: val.to_string(),

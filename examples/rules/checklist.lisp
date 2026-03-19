@@ -10,7 +10,7 @@
 (module
   (policy
     (cycle error)
-    (unknown-status todo))
+    (unknown-status none))
 
   (define (materialized_fields n)
     (list "checklist-status"))
