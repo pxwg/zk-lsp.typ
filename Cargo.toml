@@ -1,6 +1,6 @@
 [package]
 name = "zk-lsp"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 license = "AGPL-3.0"
 description = "LSP server and CLI for a Typst-based Zettelkasten wiki"
