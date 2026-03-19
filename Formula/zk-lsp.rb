@@ -2,27 +2,27 @@ class ZkLsp < Formula
   desc "Zettelkasten LSP server and CLI tools for Typst-based wikis"
   homepage "https://github.com/pxwg/zk-lsp.typ"
   license "AGPL-3.0"
-  version "0.4.1"
+  version "0.5.0"
 
   on_macos do
     on_arm do
-      url "https://github.com/pxwg/zk-lsp.typ/releases/download/v0.4.1/zk-lsp-aarch64-apple-darwin.tar.gz"
-      sha256 "4dc159f531dd698b7a8fb83ad6a6a7ba5edbeacbd2eb678458e3636a219880c2"
+      url "https://github.com/pxwg/zk-lsp.typ/releases/download/v0.5.0/zk-lsp-aarch64-apple-darwin.tar.gz"
+      sha256 "bba6e5652e7e5c11b646150f8c3c567610eef86cb812efcab0f0205e117f4cd1"
     end
     on_intel do
-      url "https://github.com/pxwg/zk-lsp.typ/releases/download/v0.4.1/zk-lsp-x86_64-apple-darwin.tar.gz"
-      sha256 "6c610a8a40d23da412ca87514f86cf1c045167b21c0f8306cce719e3df9fb59d"
+      url "https://github.com/pxwg/zk-lsp.typ/releases/download/v0.5.0/zk-lsp-x86_64-apple-darwin.tar.gz"
+      sha256 "0a3130e7bbe483d08d6c6fbc0ac95972291a38b6eeaf0ac359e396c6f9851c77"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/pxwg/zk-lsp.typ/releases/download/v0.4.1/zk-lsp-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "cf183da34ddcebbbeb4c8b1aeefffd47bf47e69b560ca6abee56d12f002cb8c1"
+      url "https://github.com/pxwg/zk-lsp.typ/releases/download/v0.5.0/zk-lsp-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "e153f26a183faca85a26d953ba38c2fadb9c834e198ab95625c57f7611cc4084"
     end
     on_intel do
-      url "https://github.com/pxwg/zk-lsp.typ/releases/download/v0.4.1/zk-lsp-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "1389cc651611d8f0e14bbf00b7cabbc4d0a641300250bcf9d2b60fefc011dbec"
+      url "https://github.com/pxwg/zk-lsp.typ/releases/download/v0.5.0/zk-lsp-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "ac2291ad63d290a05eb90203ac726ced1847ec1ac25ab0acd6b034ed7eb48763"
     end
   end
 
