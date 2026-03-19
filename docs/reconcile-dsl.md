@@ -26,6 +26,8 @@ model:
 
 - **`observe_meta(n, field)`** — raw value currently on disk for note `n`
 - **`effective_meta(n, field)`** — value after applying your DSL rules
+- **`effective_checked(c)`** — semantic checkbox status after applying your DSL rules
+- **`materialize_checked(c)`** — checkbox writeback policy used during file updates
 - **`materialized_fields(n)`** — list of field paths that are written back;
   everything else is read-only during the current run
 
@@ -58,6 +60,10 @@ Every rule file must contain a single `(module ...)` form:
   (define (effective_checked c)
     ...)
 
+  ;; Required: how checkbox c should be written back to markdown
+  (define (materialize_checked c)
+    ...)
+
   ;; Required: effective metadata value for note n, field path
   (define (effective_meta n field)
     ...))
@@ -77,6 +83,7 @@ in rule signatures are:
 |------|-------------|-------------|
 | `Bool` | `true` / `false` | [`Value::Bool`](../zk_lsp/reconcile/types/enum.Value.html) |
 | `Status` | `none` / `todo` / `wip` / `done` | [`Value::Status`](../zk_lsp/reconcile/types/enum.Value.html) |
+| `CheckboxWriteback` | `keep` / `unchecked` / `checked` | [`Value::CheckboxWriteback`](../zk_lsp/reconcile/types/enum.Value.html) |
 | `Int` | 64-bit signed integer | [`Value::Int`](../zk_lsp/reconcile/types/enum.Value.html) |
 | `Nil` | absence value; returned by `parent` for root items | [`Value::Nil`](../zk_lsp/reconcile/types/enum.Value.html) |
 | `String` | arbitrary string; non-status metadata fields | [`Value::String`](../zk_lsp/reconcile/types/enum.Value.html) |
@@ -108,6 +115,16 @@ in rule signatures are:
 | `aggregate_status(xs)` | `List(Status) → Status` | Ignores `none` when any concrete status exists; returns `none` only when all inputs are `none` or the list is empty |
 | `done?` / `todo?` / `wip?` / `none?` | `Status → Bool` | Status predicates |
 | `all_done(xs)` | `List(Status) → Bool` | True iff every element is `done` |
+
+### Checkbox Materialization
+
+`materialize_checked(c)` returns a `CheckboxWriteback`:
+
+| Literal | Meaning |
+|---------|---------|
+| `checked` | Write `- [x]` |
+| `unchecked` | Write `- [ ]` |
+| `keep` | Preserve the source checkbox text |
 
 ### Boolean Operations
 
@@ -211,18 +228,36 @@ ships with the binary:
         (observe_checked c)
         (child_status c)))
 
-  ;; Ref-item targets must ALL be done before the checkbox is done.
+  ;; Ref-item targets with status `none` are ignored; the checkbox falls back
+  ;; to its local marker in that case.
+  (define (concrete_target_statuses c)
+    (union
+      (filter done? (map target_status (targets c)))
+      (union
+        (filter todo? (map target_status (targets c)))
+        (filter wip? (map target_status (targets c))))))
+
   (define (targets_allow? c)
     (if (empty? (targets c))
         true
-        (all_done (map target_status (targets c)))))
+        (all_done (concrete_target_statuses c))))
 
   (define (effective_checked c)
     (if (empty? (targets c))
         (local_status c)
-        (if (targets_allow? c)
-            (child_status c)
-            todo)))
+        (if (empty? (concrete_target_statuses c))
+            (local_status c)
+            (if (targets_allow? c)
+                (child_status c)
+                todo))))
+
+  ;; Checkbox writeback is also controlled by DSL.
+  (define (materialize_checked c)
+    (if (done? (effective_checked c))
+        checked
+        (if (none? (effective_checked c))
+            keep
+            unchecked)))
 
   (define (target_status n)
     (effective_meta n "checklist-status"))
@@ -260,6 +295,13 @@ to it.  Demonstrates: graph queries, numeric comparisons, custom fields.
 
   (define (effective_checked c)
     (observe_checked c))
+
+  (define (materialize_checked c)
+    (if (done? (effective_checked c))
+        checked
+        (if (none? (effective_checked c))
+            keep
+            unchecked)))
 
   (define (effective_meta n field)
     (if (eq? field "user.verified")
@@ -300,6 +342,11 @@ rule treats any blocked note as `wip` regardless of its checklist state:
   (define (effective_checked c)
     (observe_checked c))
 
+  (define (materialize_checked c)
+    (if (done? (effective_checked c))
+        checked
+        unchecked))
+
   (define (effective_meta n field)
     (if (eq? field "checklist-status")
         (if (eq? (observe_meta n "user.priority") "blocked")
@@ -335,6 +382,13 @@ A research wiki where each note tracks both `checklist-status` and a
   (define (effective_checked c)
     (observe_checked c))
 
+  (define (materialize_checked c)
+    (if (done? (effective_checked c))
+        checked
+        (if (none? (effective_checked c))
+            keep
+            unchecked)))
+
   (define (effective_meta n field)
     (if (eq? field "checklist-status")
         (if (empty? (local_checkboxes n))
@@ -353,7 +407,7 @@ A research wiki where each note tracks both `checklist-status` and a
 ### 5 — Minimal custom module (from scratch)
 
 When `disable_default_reconcile_rules = true`, you must provide at least
-these three entry points:
+these four entry points:
 
 ```lisp
 (module
@@ -362,6 +416,11 @@ these three entry points:
 
   (define (effective_checked c)
     (observe_checked c))
+
+  (define (materialize_checked c)
+    (if (done? (effective_checked c))
+        checked
+        unchecked))
 
   (define (effective_meta n field)
     (observe_meta n field)))
@@ -378,7 +437,7 @@ zk-lsp reconcile [--dry-run]
         ├─ 2. Load built-in module (unless disabled)
         ├─ 3. Load + merge [[reconcile.rule]] files in order
         ├─ 4. Parse + type-check the merged module
-        ├─ 5. Evaluate: topological sort → effective_checked / effective_meta
+        ├─ 5. Evaluate: topological sort → effective_checked / materialize_checked / effective_meta
         ├─ 6. Collect diagnostics (cycles → hard abort with source locations)
         └─ 7. Write back changed states (unless --dry-run)
                └─ fail if a declared materialized field cannot be patched

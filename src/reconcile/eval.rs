@@ -6,13 +6,15 @@ use super::ast::{CyclePolicy, Expr, Module, Rule};
 use super::observe::WorkspaceSnapshot;
 use super::typecheck::{self, TypeInfo};
 use super::types::{
-    CheckboxId, DiagnosticKind, DiagnosticSeverity, EvalError, NoteId, ReconcileDiagnostic, Status,
-    Type, Value,
+    CheckboxId, CheckboxWriteback, DiagnosticKind, DiagnosticSeverity, EvalError, NoteId,
+    ReconcileDiagnostic, Status, Type, Value,
 };
 
 pub struct EvalResult {
     pub effective_meta: HashMap<(NoteId, String), Value>,
+    #[allow(dead_code)]
     pub effective_checked: HashMap<CheckboxId, Status>,
+    pub materialized_checked: HashMap<CheckboxId, CheckboxWriteback>,
     pub diagnostics: Vec<ReconcileDiagnostic>,
 }
 
@@ -512,6 +514,7 @@ impl<'a> Evaluator<'a> {
             "+" | "-" => Type::Int,
             "length" => Type::Int,
             "observe_checked" | "aggregate_status" => Type::Status,
+            "materialize_checked" => Type::CheckboxWriteback,
             "observe_meta" => match args.get(1) {
                 Some(Value::String(field)) => self
                     .snapshot
@@ -541,6 +544,7 @@ impl<'a> Evaluator<'a> {
             Type::Int => Value::Int(0),
             Type::Nil => Value::Nil,
             Type::Status => Value::Status(self.module.policy.unknown_status.clone()),
+            Type::CheckboxWriteback => Value::CheckboxWriteback(CheckboxWriteback::Keep),
             Type::String | Type::Any => Value::String(Rc::from("")),
             Type::List(_) => Value::List(Rc::new(Vec::new())),
             Type::NoteRef => Value::NoteRef(String::new()),
@@ -558,6 +562,7 @@ fn value_type(value: &Value) -> Type {
         Value::Int(_) => Type::Int,
         Value::Nil => Type::Nil,
         Value::Status(_) => Type::Status,
+        Value::CheckboxWriteback(_) => Type::CheckboxWriteback,
         Value::List(items) => items
             .first()
             .map(value_type)
@@ -628,6 +633,10 @@ pub fn eval_all_typed(
     for checkbox_id in snapshot.all_checkbox_ids() {
         let _ = ev.invoke_function(
             "effective_checked",
+            vec![Value::CheckboxRef(checkbox_id.clone())],
+        );
+        let _ = ev.invoke_function(
+            "materialize_checked",
             vec![Value::CheckboxRef(checkbox_id.clone())],
         );
     }
@@ -703,9 +712,27 @@ pub fn eval_all_typed(
         })
         .collect::<HashMap<_, _>>();
 
+    let materialized_checked = ev
+        .call_cache
+        .iter()
+        .filter_map(|(key, value)| {
+            if key.name.as_ref() == "materialize_checked" && key.args.len() == 1 {
+                match (&key.args[0], value) {
+                    (Value::CheckboxRef(cid), Value::CheckboxWriteback(writeback)) => {
+                        Some((cid.clone(), *writeback))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+        .collect::<HashMap<_, _>>();
+
     EvalResult {
         effective_meta,
         effective_checked,
+        materialized_checked,
         diagnostics: ev.diagnostics,
     }
 }
@@ -815,11 +842,34 @@ mod tests {
         let note_b = make_toml_note("B", "2222222222", "done", "");
         let note_a = make_toml_note("A", "1111111111", "none", "- [ ] @2222222222\n");
         let snap = snapshot_from(&[("1111111111", &note_a), ("2222222222", &note_b)]);
+        let checkbox_id = snap.local_checkboxes(&"1111111111".to_string())[0].clone();
         let module = default_module();
         let result = eval_all(&module, &snap);
         assert_eq!(
             checklist_status_field(&result, "1111111111"),
             Some(Status::Done)
+        );
+        assert_eq!(
+            result.materialized_checked.get(&checkbox_id).copied(),
+            Some(CheckboxWriteback::Checked)
+        );
+    }
+
+    #[test]
+    fn ref_checkbox_target_none_falls_back_to_local_marker() {
+        let note_b = make_toml_note("B", "2222222222", "none", "");
+        let note_a = make_toml_note("A", "1111111111", "none", "- [x] @2222222222\n");
+        let snap = snapshot_from(&[("1111111111", &note_a), ("2222222222", &note_b)]);
+        let checkbox_id = snap.local_checkboxes(&"1111111111".to_string())[0].clone();
+        let module = default_module();
+        let result = eval_all(&module, &snap);
+        assert_eq!(
+            checklist_status_field(&result, "1111111111"),
+            Some(Status::Done)
+        );
+        assert_eq!(
+            result.materialized_checked.get(&checkbox_id).copied(),
+            Some(CheckboxWriteback::Checked)
         );
     }
 
@@ -915,6 +965,7 @@ mod tests {
         (module
           (define (materialized_fields n) (list "user.sum"))
           (define (effective_checked c) (observe_checked c))
+          (define (materialize_checked c) unchecked)
           (define (effective_meta n field)
             (if (eq? field "user.sum")
                 (reduce + 0 (list 1 2 3))
@@ -935,6 +986,7 @@ mod tests {
         (module
           (define (materialized_fields n) (list "user.done_count"))
           (define (effective_checked c) (observe_checked c))
+          (define (materialize_checked c) unchecked)
           (define (is_done m) (done? (observe_meta m "checklist-status")))
           (define (effective_meta n field)
             (if (eq? field "user.done_count")
@@ -965,6 +1017,7 @@ mod tests {
         (module
           (define (materialized_fields n) (list "user.verified"))
           (define (effective_checked c) (observe_checked c))
+          (define (materialize_checked c) unchecked)
           (define (is_done m) (done? (observe_meta m "checklist-status")))
           (define (effective_meta n field)
             (if (eq? field "user.verified")
@@ -1031,6 +1084,7 @@ mod tests {
         (module
           (define (materialized_fields n) (list "user.count"))
           (define (effective_checked c) (observe_checked c))
+          (define (materialize_checked c) unchecked)
           (define (effective_meta n field)
             (if (eq? field "user.count")
                 (length (dedup (union (backlinks n) (backlinks n))))
@@ -1058,6 +1112,7 @@ mod tests {
         (module
           (define (materialized_fields n) (list "user.has_backlink"))
           (define (effective_checked c) (observe_checked c))
+          (define (materialize_checked c) unchecked)
           (define (effective_meta n field)
             (if (eq? field "user.has_backlink")
                 (if (contains? (backlinks n) n)
@@ -1083,6 +1138,7 @@ mod tests {
         (module
           (define (materialized_fields n) (list))
           (define (effective_checked c) done)
+          (define (materialize_checked c) checked)
           (define (effective_meta n field) (observe_meta n field)))
         "#;
         let module = parse_module(src).expect("module parses");

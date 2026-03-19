@@ -98,6 +98,45 @@ impl fmt::Display for Status {
     }
 }
 
+/// Checkbox writeback directives used during the materialize phase.
+///
+/// These control how a checkbox line should be written back to disk after
+/// `effective_checked` has produced a semantic `Status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CheckboxWriteback {
+    /// Leave the source checkbox text unchanged.
+    Keep,
+    /// Materialize as `- [ ]`.
+    Unchecked,
+    /// Materialize as `- [x]`.
+    Checked,
+}
+
+impl CheckboxWriteback {
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::Unchecked => "unchecked",
+            Self::Checked => "checked",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "keep" => Some(Self::Keep),
+            "unchecked" => Some(Self::Unchecked),
+            "checked" => Some(Self::Checked),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for CheckboxWriteback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_str())
+    }
+}
+
 /// Runtime value in the Reconcile DSL evaluator.
 ///
 /// The type system is checked statically before evaluation; these variants
@@ -113,6 +152,8 @@ pub enum Value {
     Nil,
     /// One of `none` / `todo` / `wip` / `done`.
     Status(Status),
+    /// One of `keep` / `unchecked` / `checked`.
+    CheckboxWriteback(CheckboxWriteback),
     /// Homogeneous list; shared via reference-counting.
     List(Rc<Vec<Value>>),
     /// Runtime handle to a note (evaluator-internal).
@@ -130,6 +171,7 @@ pub enum Type {
     Int,
     Nil,
     Status,
+    CheckboxWriteback,
     String,
     NoteRef,
     CheckboxRef,
@@ -144,6 +186,7 @@ impl fmt::Display for Type {
             Type::Int => write!(f, "Int"),
             Type::Nil => write!(f, "Nil"),
             Type::Status => write!(f, "Status"),
+            Type::CheckboxWriteback => write!(f, "CheckboxWriteback"),
             Type::String => write!(f, "String"),
             Type::NoteRef => write!(f, "NoteRef"),
             Type::CheckboxRef => write!(f, "CheckboxRef"),

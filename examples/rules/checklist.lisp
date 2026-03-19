@@ -25,17 +25,33 @@
         (observe_checked c)
         (child_status c)))
 
+  (define (concrete_target_statuses c)
+    (union
+      (filter done? (map target_status (targets c)))
+      (union
+        (filter todo? (map target_status (targets c)))
+        (filter wip? (map target_status (targets c))))))
+
   (define (targets_allow? c)
     (if (empty? (targets c))
         true
-        (all_done (map target_status (targets c)))))
+        (all_done (concrete_target_statuses c))))
 
   (define (effective_checked c)
     (if (empty? (targets c))
         (local_status c)
-        (if (targets_allow? c)
-            (child_status c)
-            todo)))
+        (if (empty? (concrete_target_statuses c))
+            (local_status c)
+            (if (targets_allow? c)
+                (child_status c)
+                todo))))
+
+  (define (materialize_checked c)
+    (if (done? (effective_checked c))
+        checked
+        (if (none? (effective_checked c))
+            keep
+            unchecked)))
 
   (define (target_status n)
     (effective_meta n "checklist-status"))

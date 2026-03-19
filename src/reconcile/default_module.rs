@@ -37,7 +37,12 @@ pub fn load_module(rule_paths: &[PathBuf], disable_default_rules: bool) -> Resul
 }
 
 fn validate_required_rules(module: &Module) -> Result<()> {
-    const REQUIRED_RULES: &[&str] = &["materialized_fields", "effective_checked", "effective_meta"];
+    const REQUIRED_RULES: &[&str] = &[
+        "materialized_fields",
+        "effective_checked",
+        "materialize_checked",
+        "effective_meta",
+    ];
     let missing: Vec<&str> = REQUIRED_RULES
         .iter()
         .copied()
@@ -207,6 +212,7 @@ mod tests {
                  (policy (cycle unknown))
                  (define (materialized_fields n) (list))
                  (define (effective_checked c) (observe_checked c))
+                 (define (materialize_checked c) keep)
                  (define (effective_meta n field) (observe_meta n field)))"#,
         )
         .expect("write");

@@ -28,6 +28,14 @@
   (define (effective_checked c)
     (observe_checked c))
 
+  ;; Checkbox materialization: preserve the current source marker for `none`.
+  (define (materialize_checked c)
+    (if (done? (effective_checked c))
+        checked
+        (if (none? (effective_checked c))
+            keep
+            unchecked)))
+
   ;; Effective metadata: compute user.verified dynamically, pass through rest.
   (define (effective_meta n field)
     (if (eq? field "user.verified")

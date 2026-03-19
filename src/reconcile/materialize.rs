@@ -2,24 +2,20 @@
 use std::collections::HashMap;
 
 use super::eval::EvalResult;
-use super::types::{CheckboxId, NoteId, Status, Value};
+use super::types::{CheckboxId, CheckboxWriteback, NoteId, Value};
 
 /// v1: materialized == effective (identity projection).
 pub struct ReconcileResult {
     #[allow(dead_code)]
     pub materialized_meta: HashMap<(NoteId, String), Value>,
-    pub materialized_checked: HashMap<CheckboxId, bool>,
+    pub materialized_checked: HashMap<CheckboxId, CheckboxWriteback>,
 }
 
 /// v1: identity — materialized == effective.
 pub fn materialize(eval: EvalResult) -> ReconcileResult {
     ReconcileResult {
         materialized_meta: eval.effective_meta,
-        materialized_checked: eval
-            .effective_checked
-            .into_iter()
-            .map(|(cid, status)| (cid, status == Status::Done))
-            .collect(),
+        materialized_checked: eval.materialized_checked,
     }
 }
 
@@ -36,6 +32,7 @@ mod tests {
     use crate::reconcile::eval::eval_all;
     use crate::reconcile::observe::WorkspaceSnapshot;
     use crate::reconcile::parser::parse_module;
+    use crate::reconcile::types::Status;
 
     #[test]
     fn v1_identity() {

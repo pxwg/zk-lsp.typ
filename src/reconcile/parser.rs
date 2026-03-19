@@ -1,6 +1,6 @@
 /// S-expression tokenizer + recursive-descent parser for the Reconcile DSL.
 use super::ast::{CyclePolicy, Expr, Module, Policy, Rule};
-use super::types::{ParseError, Status, Value};
+use super::types::{CheckboxWriteback, ParseError, Status, Value};
 use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
@@ -329,6 +329,9 @@ fn parse_expr(p: &mut Parser) -> Result<Expr, ParseError> {
             if s == "false" {
                 return Ok(Expr::Lit(Value::Bool(false)));
             }
+            if let Some(writeback) = CheckboxWriteback::from_str(&s) {
+                return Ok(Expr::Lit(Value::CheckboxWriteback(writeback)));
+            }
             // status literals
             if let Some(status) = Status::from_str(&s) {
                 return Ok(Expr::Lit(Value::Status(status)));
@@ -413,14 +416,42 @@ mod tests {
     #[test]
     fn valid_default_module() {
         let module = parse_module(DEFAULT_MODULE).expect("default module must parse");
-        assert_eq!(module.rules.len(), 7, "expected 7 rules in default module");
+        assert_eq!(module.rules.len(), 9, "expected 9 rules in default module");
         assert!(module.rules.iter().any(|r| r.name == "materialized_fields"));
         assert!(module.rules.iter().any(|r| r.name == "child_status"));
         assert!(module.rules.iter().any(|r| r.name == "local_status"));
+        assert!(module
+            .rules
+            .iter()
+            .any(|r| r.name == "concrete_target_statuses"));
         assert!(module.rules.iter().any(|r| r.name == "targets_allow?"));
         assert!(module.rules.iter().any(|r| r.name == "effective_checked"));
+        assert!(module.rules.iter().any(|r| r.name == "materialize_checked"));
         assert!(module.rules.iter().any(|r| r.name == "target_status"));
         assert!(module.rules.iter().any(|r| r.name == "effective_meta"));
+    }
+
+    #[test]
+    fn checkbox_writeback_literals_parse() {
+        let src = r#"
+        (module
+          (define (a c) checked)
+          (define (b c) unchecked)
+          (define (c_rule c) keep))
+        "#;
+        let module = parse_module(src).expect("should parse");
+        assert!(matches!(
+            &module.rules[0].body,
+            Expr::Lit(Value::CheckboxWriteback(CheckboxWriteback::Checked))
+        ));
+        assert!(matches!(
+            &module.rules[1].body,
+            Expr::Lit(Value::CheckboxWriteback(CheckboxWriteback::Unchecked))
+        ));
+        assert!(matches!(
+            &module.rules[2].body,
+            Expr::Lit(Value::CheckboxWriteback(CheckboxWriteback::Keep))
+        ));
     }
 
     #[test]

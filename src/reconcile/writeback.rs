@@ -6,6 +6,7 @@ use tower_lsp::lsp_types::{Position, Range, TextEdit};
 
 use crate::handlers::formatting::compute_toml_status_edit;
 use crate::parser::{self, ChecklistStatus, StatusTag};
+use crate::reconcile::types::CheckboxWriteback;
 
 static RE_TODO_ID: Lazy<Regex> = Lazy::new(|| Regex::new(r"@(\d{10})").unwrap());
 
@@ -65,7 +66,7 @@ pub fn normalize_note(content: &str, dep_states: &HashMap<String, bool>) -> Stri
 
 pub fn normalize_note_from_checked(
     content: &str,
-    checked_by_line: &HashMap<usize, bool>,
+    checked_by_line: &HashMap<usize, CheckboxWriteback>,
 ) -> String {
     let after_refs = update_ref_checkboxes_by_line(content, checked_by_line);
     let after_nested = update_nested_checkboxes(&after_refs);
@@ -116,7 +117,10 @@ fn update_ref_checkboxes_sync(content: &str, dep_states: &HashMap<String, bool>)
     out
 }
 
-fn update_ref_checkboxes_by_line(content: &str, checked_by_line: &HashMap<usize, bool>) -> String {
+fn update_ref_checkboxes_by_line(
+    content: &str,
+    checked_by_line: &HashMap<usize, CheckboxWriteback>,
+) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let mut result: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
     let mut changed = false;
@@ -130,8 +134,14 @@ fn update_ref_checkboxes_by_line(content: &str, checked_by_line: &HashMap<usize,
         if in_fence || !is_todo_line(line) || !RE_TODO_ID.is_match(line) {
             continue;
         }
-        if let Some(&checked) = checked_by_line.get(&i) {
-            let new_state = if checked { 'x' } else { ' ' };
+        if let Some(&writeback) = checked_by_line.get(&i) {
+            let Some(new_state) = (match writeback {
+                CheckboxWriteback::Checked => Some('x'),
+                CheckboxWriteback::Unchecked => Some(' '),
+                CheckboxWriteback::Keep => None,
+            }) else {
+                continue;
+            };
             if get_todo_state(line) != Some(new_state) {
                 if let Some(new_line) = replace_todo_state(line, new_state) {
                     result[i] = new_line;
@@ -396,6 +406,14 @@ mod tests {
         let after_refs = update_ref_checkboxes_sync(input, &dep_states);
         let out = update_nested_checkboxes(&after_refs);
         assert!(out.starts_with("- [ ]"));
+    }
+
+    #[test]
+    fn none_status_does_not_rewrite_ref_checkbox() {
+        let input = "- [x] @1234567890 task\n";
+        let checked_by_line = HashMap::from([(0usize, CheckboxWriteback::Keep)]);
+        let out = normalize_note_from_checked(input, &checked_by_line);
+        assert_eq!(out, input);
     }
 
     #[test]

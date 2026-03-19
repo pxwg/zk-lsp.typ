@@ -105,6 +105,7 @@ fn type_from_value(value: &Value) -> Type {
         Value::Int(_) => Type::Int,
         Value::Nil => Type::Nil,
         Value::Status(_) => Type::Status,
+        Value::CheckboxWriteback(_) => Type::CheckboxWriteback,
         Value::List(items) => items
             .first()
             .map(type_from_value)
@@ -678,6 +679,14 @@ fn bootstrap_call_type(name: &str, args: &[Expr], metadata_kinds: &HashMap<Strin
     }
 }
 
+fn expected_rule_return_type(rule_name: &str) -> Option<Type> {
+    match rule_name {
+        "effective_checked" => Some(Type::Status),
+        "materialize_checked" => Some(Type::CheckboxWriteback),
+        _ => None,
+    }
+}
+
 fn infer_param_type(rule_name: &str, param: &str, index: usize) -> Type {
     if param == "field" || param == "path" {
         return Type::String;
@@ -753,6 +762,9 @@ pub fn type_check_module_with_metadata(
         let inferred = infer_type(&rule.body, &env)?;
         let expected = return_types.get(&rule.name).cloned().unwrap_or(Type::Any);
         ensure_type(&inferred, &expected)?;
+        if let Some(required_type) = expected_rule_return_type(&rule.name) {
+            ensure_type(&inferred, &required_type)?;
+        }
     }
 
     Ok(TypeInfo {
@@ -775,6 +787,20 @@ mod tests {
     fn default_module_passes_typecheck() {
         let module = parse(DEFAULT_MODULE);
         type_check_module(&module).expect("default module should typecheck");
+    }
+
+    #[test]
+    fn materialize_checked_must_return_checkbox_writeback() {
+        let src = r#"
+        (module
+          (define (materialized_fields n) (list))
+          (define (effective_checked c) done)
+          (define (materialize_checked c) done)
+          (define (effective_meta n field) (observe_meta n field)))
+        "#;
+        let module = parse(src);
+        let err = type_check_module(&module).expect_err("should fail");
+        assert!(matches!(err, TypeError::TypeMismatch { .. }));
     }
 
     #[test]

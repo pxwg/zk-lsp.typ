@@ -29,7 +29,8 @@ use self::default_module::load_module;
 use self::materialize::materialize;
 use self::observe::WorkspaceSnapshot;
 use self::types::{
-    DiagnosticKind, DiagnosticLocation, DiagnosticSeverity, NoteId, ReconcileDiagnostic, Value,
+    CheckboxWriteback, DiagnosticKind, DiagnosticLocation, DiagnosticSeverity, NoteId,
+    ReconcileDiagnostic, Value,
 };
 use self::writeback::normalize_note_from_checked;
 
@@ -63,11 +64,11 @@ pub async fn run_reconcile(config: &WikiConfig, dry_run: bool) -> Result<Reconci
     let reconcile_result = materialize(eval_result);
     let mut files_changed = 0usize;
     for (_id, (path, content)) in &notes {
-        let checked_by_line: HashMap<usize, bool> = reconcile_result
+        let checked_by_line: HashMap<usize, CheckboxWriteback> = reconcile_result
             .materialized_checked
             .iter()
             .filter(|(cid, _)| cid.note_id == *_id)
-            .map(|(cid, checked)| (cid.line_idx, *checked))
+            .map(|(cid, writeback)| (cid.line_idx, *writeback))
             .collect();
 
         let after_checked = normalize_note_from_checked(content, &checked_by_line);
@@ -151,7 +152,7 @@ fn value_to_toml(value: &Value) -> Option<toml::Value> {
             }
             Some(toml::Value::Array(out))
         }
-        Value::NoteRef(_) | Value::CheckboxRef(_) => None,
+        Value::CheckboxWriteback(_) | Value::NoteRef(_) | Value::CheckboxRef(_) => None,
     }
 }
 
@@ -908,6 +909,8 @@ mod tests {
             (list "checklist-status" "user.label"))
           (define (effective_checked c)
             (observe_checked c))
+          (define (materialize_checked c)
+            unchecked)
           (define (effective_meta n field)
             (if (eq? field "checklist-status")
                 done
@@ -948,6 +951,8 @@ mod tests {
             (list "user.label"))
           (define (effective_checked c)
             (observe_checked c))
+          (define (materialize_checked c)
+            unchecked)
           (define (effective_meta n field)
             (if (eq? field "user.label")
                 "synced"
