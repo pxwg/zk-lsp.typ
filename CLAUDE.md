@@ -11,7 +11,7 @@ Rust LSP binary for the `~/wiki` Typst-based Zettelkasten.
 ```bash
 cargo build          # dev build
 cargo build --release
-cargo test           # 65 tests across parser, formatting, migrate, reconcile, cycle, diagnostics, code_actions, completion, graph_check, context_export
+cargo test           # 211 tests across parser, formatting, migrate, reconcile, cycle, diagnostics, code_actions, completion, graph_check, context_export, hooks, config
 cargo test <name>    # run a single test by name (substring match)
 cargo fmt            # formatting should be run before every commit
 ```
@@ -33,6 +33,37 @@ zk-lsp check [--no-orphans] [--no-dead-links]  # graph integrity: dead links + o
 ```
 
 `WIKI_ROOT` env overrides the `~/wiki` default. `--wiki-root` overrides `WIKI_ROOT`.
+
+## Configuration
+
+Configuration is merged from two TOML files (project overrides user):
+
+| Path | Scope |
+|------|-------|
+| `$XDG_CONFIG_HOME/zk-lsp/config.toml` | User-level |
+| `<wiki-root>/zk-lsp.toml` | Project-level |
+
+Key config sections:
+
+```toml
+# Lua hooks (run on willSaveWaitUntil)
+[[hooks]]
+path = "~/.config/zk-lsp/hooks/my_hook.lua"
+
+# Reconcile DSL rule files (Lisp-based)
+[[reconcile_rules]]
+path = "~/.config/zk-lsp/rules/checklist.lisp"
+
+disable_default_reconcile_rules = false   # set true to replace built-in rules
+
+# User-defined metadata fields (user.* namespace only)
+[[metadata.field]]
+path    = "user.priority"
+kind    = "string"           # or "boolean", "array-string"
+default = "normal"
+```
+
+Examples in `examples/hooks/` and `examples/rules/`.
 
 ## Wiki Note Structure
 
@@ -77,7 +108,7 @@ Parser tries TOML path first; falls back to legacy. `parse_header()` no longer c
 
 - **Parser is stateless** — `src/parser.rs` takes `&str`, returns owned structs. No I/O.
 - **Index is async** — `NoteIndex` uses `DashMap`; all file I/O via `tokio::fs`.
-- **Atomic writes** — `link.typ` is always written via `tmp → rename`.
+- **Atomic writes** — `link.typ` and note files are always written via `tmp → rename`.
 - **Tracing to stderr** — stdout is reserved for JSON-RPC. Use `tracing::{info, error, …}`.
 - **ID format** — exactly 10 ASCII digits (`YYMMDDHHMM`). Regex: `@(\d{10})`.
 
@@ -96,12 +127,13 @@ These files are authoritative for behaviour parity:
 ```
 src/
 ├── main.rs               CLI dispatch + LSP server startup
+├── lib.rs                Re-exports for integration tests
+├── init.rs               LSP initialization helper
 ├── cli.rs                clap CLI definitions
-├── config.rs             WikiConfig resolution
+├── config.rs             WikiConfig resolution; ZkLspConfig (hooks, reconcile_rules, metadata fields)
 ├── parser.rs             Stateless note parsing (unit-tested)
 ├── dependency_graph.rs   build_dependency_graph: RefItem → positioned edge list
 ├── cycle.rs              detect_cycles (Tarjan SCC) + render_cycle_errors (CLI)
-├── reconcile.rs          single-pass DAG eval + batch write-back; fails on cycles
 ├── graph_check.rs        check_graph (dead links + orphans) + render_check_report (CLI)
 ├── context_export.rs     export_context: BFS Markdown for AI consumption
 ├── index.rs              NoteIndex (DashMap notes + backlinks)
@@ -110,14 +142,68 @@ src/
 ├── note_ops.rs           create_note / delete_note
 ├── server.rs             tower-lsp LanguageServer impl
 ├── watcher.rs            notify-debouncer-mini (300 ms) on note_dir
+├── hooks/
+│   ├── types.rs         HookNoteInput, HookCheckbox, HookTextEdit, HookResult structs
+│   ├── lua.rs           Lua VM host (mlua); runs hook run(note) → HookResult
+│   └── apply.rs         apply_hooks: load + call all configured hooks, apply edits + metadata patch
+├── reconcile/            Reconcile DSL v1 — Lisp-based rule engine for workspace-wide reconciliation
+│   ├── types.rs         Value, Status, NoteId, ReconcileDiagnostic
+│   ├── ast.rs           Module, Expr AST nodes
+│   ├── parser.rs        parse_module: s-expression parser for rule files
+│   ├── typecheck.rs     type_check_module_with_metadata: static type checker
+│   ├── default_module.rs load_module: built-in + user rule files; hot-reload on file change
+│   ├── observe.rs       WorkspaceSnapshot: read notes into typed observation structs
+│   ├── eval.rs          eval_all_typed: evaluate rules against snapshot → EvalResult
+│   ├── materialize.rs   materialize: EvalResult → ReconcileResult (checkboxes + meta patches)
+│   ├── writeback.rs     normalize_note_from_checked, is_note_done_with_deps
+│   └── mod.rs           run_reconcile, collect_diagnostics (public API)
 └── handlers/
     ├── references.rs    find_references (uses backlink index)
     ├── diagnostics.rs   dead link ERROR + archived/legacy/orphan/cycle/schema diagnostics
     ├── code_actions.rs  quick-fixes + metadata toggle actions (checklist-status, relation)
     ├── completion.rs    TOML metadata completions (enum values, note IDs, field names)
+    ├── definition.rs    go-to-definition for @ID in relation-target fields
+    ├── hover.rs         hover preview for @ID references
     ├── inlay_hints.rs   @ID → title after cursor
-    └── formatting.rs    willSaveWaitUntil tag edit + cross-file propagation
+    └── formatting.rs    willSaveWaitUntil: apply hooks + tag normalization
 ```
+
+## Lua Hooks
+
+Hooks are Lua scripts called on `willSaveWaitUntil`. Each must expose:
+
+```lua
+function run(note)
+  -- note.id, note.content, note.metadata, note.checkboxes, note.headings
+  -- note.metadata_defaults (config-declared field defaults)
+  -- note.metadata_fields (declared field configs)
+  return {
+    metadata = { ["checklist-status"] = "done" },  -- optional patch
+    edits    = { { start_byte = 42, end_byte = 43, text = "x" } },  -- optional byte edits
+  }
+end
+```
+
+Both fields are optional. Edits must be non-overlapping; overlapping edits error. Applied in reverse byte order.
+
+## Reconcile DSL
+
+Rules are Lisp s-expressions. Three required functions:
+
+```lisp
+(module
+  (define (materialized_fields n)       ; → list of field names to materialize
+    (list "checklist-status"))
+  (define (effective_checked c)         ; → bool: should checkbox be checked?
+    (observe_checked c))
+  (define (effective_meta n field)      ; → value to write for field
+    (observe_meta n field)))
+```
+
+Built-in observables: `observe_checked`, `observe_meta`, `backlinks`, `children`, `parent`, `owner`.
+Built-in combinators: `filter`, `reduce`, `map`, `length`, `contains`, `union`, `dedup`, `if`, `eq?`, `+`, `>`, `>=`.
+
+See `examples/rules/` for working examples.
 
 ## Neovim Integration
 
@@ -149,27 +235,25 @@ note.done = ∀ leaf_item ∈ items: eval_item_truth(leaf_item) == true
 ```
 
 **Responsibility split:**
-- **Formatter** (`formatting.rs`): current-file normalization + read-only dep_states lookup (trusts reconciled metadata via `is_note_done`); no graph solving. `is_note_done_with_deps` is the canonical semantic evaluator.
-- **Reconcile** (`reconcile.rs`): build dependency graph → detect cycles (fail fast) → Kahn topo-sort → single-pass DAG evaluation → batch write-back. No convergence loop.
-- **Cycles** — hard error. `detect_cycles` (Tarjan SCC) returns `Vec<DependencyCycle>`; CLI renders Typst-style errors with ANSI colour and CJK-aware `^` alignment; LSP emits per-file `ERROR` diagnostics via `get_cycle_diagnostics`.
+- **Formatter** (`formatting.rs`): runs hooks, then normalizes current-file checkboxes using dep_states from reconciled metadata. `is_note_done_with_deps` is the canonical semantic evaluator.
+- **Reconcile** (`reconcile/`): load rules → typecheck → observe workspace snapshot → eval all rules → materialize → batch write-back. Fails fast on cycles.
+- **Cycles** — hard error. Tarjan SCC in `reconcile/mod.rs` and `cycle.rs`; CLI renders Typst-style errors with ANSI colour and CJK-aware `^` alignment; LSP emits per-file `ERROR` diagnostics.
 
 **Key functions:**
-- `parser::parse_checklist_items(content)` → `Vec<ChecklistItem>` (skips fenced blocks)
-- `parser::eval_item_truth(item, done_lookup)` → bool
-- `parser::compute_note_done_from_items(items, done_lookup)` → bool (leaf-only)
 - `parser::find_all_refs_filtered(content)` → `Vec<RefOccurrence>` (skips TOML block, `/* */` comments, fenced blocks)
 - `dependency_graph::build_dependency_graph(notes)` → `DependencyGraph`
-- `cycle::detect_cycles(graph)` → `Vec<DependencyCycle>`
-- `cycle::render_cycle_errors(cycles)` → `String` (CLI; byte columns, ANSI colour, CJK width)
-- `diagnostics::get_cycle_diagnostics(content, path, cycles)` → `Vec<Diagnostic>` (LSP; UTF-16)
-- `diagnostics::get_schema_diagnostics(content, index)` → `Vec<Diagnostic>` (validates TOML metadata fields)
-- `diagnostics::get_orphan_diagnostic(content, uri_path, index)` → `Option<Diagnostic>` (HINT if note has no backlinks)
-- `diagnostics::get_checklist_diagnostics(content)` → `Vec<Diagnostic>` (WARNING if RefItem is non-leaf)
-- `graph_check::check_graph(config)` → `CheckReport` (dead links + orphans across whole wiki)
-- `graph_check::render_check_report(report)` → `String` (Typst-error style CLI output; stdout TTY-aware)
-- `context_export::export_context(entry_id, depth, inverse, config)` → `String` (BFS/inverse Markdown document; `inverse=true` follows backlinks, reverses output)
-- `code_actions::get_metadata_actions(uri, content, range)` → `Vec<CodeActionOrCommand>` (checklist-status toggle, relation switch)
-- `completion::get_completions(content, position, index)` → `Vec<CompletionItem>` (TOML enum values, note IDs, field names)
+- `reconcile::run_reconcile(config, dry_run)` → `ReconcileStats`
+- `reconcile::collect_diagnostics(config, overlay)` → `Vec<ReconcileDiagnostic>` (LSP path)
+- `reconcile::writeback::is_note_done_with_deps(content, deps)` → bool
+- `reconcile::writeback::normalize_note_from_checked(content, checked_by_line)` → String
+- `diagnostics::get_schema_diagnostics(content, index)` → `Vec<Diagnostic>`
+- `diagnostics::get_orphan_diagnostic(content, uri_path, index)` → `Option<Diagnostic>`
+- `diagnostics::get_checklist_diagnostics(content)` → `Vec<Diagnostic>`
+- `graph_check::check_graph(config)` → `CheckReport`
+- `context_export::export_context(entry_id, depth, inverse, config)` → `String`
+- `code_actions::get_metadata_actions(uri, content, range)` → `Vec<CodeActionOrCommand>`
+- `completion::get_completions(content, position, index)` → `Vec<CompletionItem>`
+- `hooks::apply::apply_hooks(content, note_id, config)` → `Result<String>`
 
 ## LSP Commands
 
