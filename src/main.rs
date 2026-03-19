@@ -60,8 +60,8 @@ async fn main() -> anyhow::Result<()> {
             link_gen::generate_link_typ(&config).await?;
             eprintln!("link.typ regenerated at {}", config.link_file.display());
         }
-        Command::New => {
-            let path = note_ops::create_note(&config).await?;
+        Command::New { id } => {
+            let path = note_ops::create_note(&config, id).await?;
             println!("{}", path.display());
         }
         Command::Remove { id } => {

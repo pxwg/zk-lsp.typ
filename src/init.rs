@@ -117,7 +117,7 @@ pub async fn init_wiki(config: &WikiConfig) -> Result<()> {
     }
 
     // 5. Sample note
-    let note_path = note_ops::create_note(config).await?;
+    let note_path = note_ops::create_note(config, None).await?;
     eprintln!("  created  {}", note_path.display());
 
     eprintln!("\nWiki initialised at {}", root.display());

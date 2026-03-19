@@ -87,10 +87,28 @@ fn build_note_content(id: &str, config: &WikiConfig) -> String {
     )
 }
 
-/// Create a new note with the current timestamp as ID.
+/// Validate that a note ID is exactly 10 ASCII decimal digits.
+pub fn validate_note_id(id: &str) -> Result<()> {
+    if id.len() == 10 && id.chars().all(|c| c.is_ascii_digit()) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "invalid note ID {:?}: must be exactly 10 decimal digits (YYMMDDHHMM)",
+            id
+        )
+    }
+}
+
+/// Create a new note, optionally using a caller-supplied ID.
 /// Returns the path to the new file.
-pub async fn create_note(config: &WikiConfig) -> Result<PathBuf> {
-    let id = Local::now().format("%y%m%d%H%M").to_string();
+pub async fn create_note(config: &WikiConfig, custom_id: Option<String>) -> Result<PathBuf> {
+    let id = match custom_id {
+        Some(id) => {
+            validate_note_id(&id)?;
+            id
+        }
+        None => Local::now().format("%y%m%d%H%M").to_string(),
+    };
     fs::create_dir_all(&config.note_dir).await?;
 
     let path = config.note_dir.join(format!("{id}.typ"));
@@ -120,6 +138,31 @@ pub async fn delete_note(id: &str, config: &WikiConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_note_id_valid() {
+        assert!(validate_note_id("2602110128").is_ok());
+        assert!(validate_note_id("0000000000").is_ok());
+        assert!(validate_note_id("9999999999").is_ok());
+    }
+
+    #[test]
+    fn test_validate_note_id_too_short() {
+        assert!(validate_note_id("260211012").is_err());
+        assert!(validate_note_id("").is_err());
+    }
+
+    #[test]
+    fn test_validate_note_id_too_long() {
+        assert!(validate_note_id("26021101280").is_err());
+    }
+
+    #[test]
+    fn test_validate_note_id_non_numeric() {
+        assert!(validate_note_id("260211012x").is_err());
+        assert!(validate_note_id("YYMMDDHHMM").is_err());
+        assert!(validate_note_id("2602110128 ").is_err());
+    }
     use crate::config::{MetadataConfig, MetadataFieldConfig, MetadataFieldKind, ZkLspConfig};
     use crate::parser;
 

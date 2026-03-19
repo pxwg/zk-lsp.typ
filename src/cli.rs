@@ -20,7 +20,11 @@ pub enum Command {
     /// Regenerate link.typ from the note directory
     Generate,
     /// Create a new note and print its path to stdout
-    New,
+    New {
+        /// Custom 10-digit note ID (YYMMDDHHMM); defaults to current timestamp
+        #[arg(long)]
+        id: Option<String>,
+    },
     /// Delete a note and remove it from link.typ
     Remove {
         /// The 10-digit note ID (YYMMDDHHMM)

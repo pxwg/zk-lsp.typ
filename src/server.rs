@@ -399,7 +399,7 @@ impl LanguageServer for ZkLspServer {
             }
             "zk.newNote" => {
                 let config = self.current_config().await;
-                match note_ops::create_note(&config).await {
+                match note_ops::create_note(&config, None).await {
                     Ok(path) => {
                         info!("created note: {}", path.display());
                         let uri = Url::from_file_path(&path).ok();
