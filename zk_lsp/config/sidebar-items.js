@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CORE_METADATA_FIELDS"],"enum":["MetadataFieldKind"],"fn":["merge_metadata","parse_hooks_config","parse_metadata_config","parse_reconcile_rules_config","parse_root_dir_value","resolve_config_path","url_to_path"],"struct":["MetadataConfig","MetadataFieldConfig","WikiConfig","ZkLspConfig"]};
