@@ -168,7 +168,7 @@ impl LanguageServer for ZkLspServer {
                 Err(e) => error!("index build failed: {e}"),
             }
             // Start filesystem watcher
-            if let Err(e) = watcher::start_watcher(config, index) {
+            if let Err(e) = watcher::start_watcher(config, index).await {
                 error!("watcher start failed: {e}");
             }
         });
@@ -194,6 +194,9 @@ impl LanguageServer for ZkLspServer {
             let _ = self.index.update_file(&path).await;
         }
         self.publish_diagnostics(uri, &content).await;
+        // Tell VS Code to re-request inlay hints for this newly opened file.
+        // Without this, VS Code caches the empty first response and never retries.
+        let _ = self.client.inlay_hint_refresh().await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
