@@ -14,14 +14,14 @@ use crate::link_gen;
 
 /// Start the filesystem watcher on note_dir.
 /// Sends events (Create / Modify / Remove) to the returned receiver.
-pub fn start_watcher(
+pub async fn start_watcher(
     config: Arc<RwLock<WikiConfig>>,
     index: Arc<NoteIndex>,
 ) -> Result<tokio::task::JoinHandle<()>> {
     let (tx, mut rx) = mpsc::channel::<Vec<DebouncedEvent>>(64);
 
     let note_dir = {
-        let config = config.blocking_read();
+        let config = config.read().await;
         config.note_dir.clone()
     };
 
