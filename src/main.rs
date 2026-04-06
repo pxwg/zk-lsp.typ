@@ -61,8 +61,25 @@ async fn main() -> anyhow::Result<()> {
             link_gen::generate_link_typ(&config).await?;
             eprintln!("link.typ regenerated at {}", config.link_file.display());
         }
-        Command::New { id } => {
-            let path = note_ops::create_note(&config, id).await?;
+        Command::New { id, meta, json } => {
+            let mut overrides = note_ops::MetaOverrides::new();
+            let mut title = None;
+            let mut body = None;
+            if json {
+                use std::io::Read;
+                let mut s = String::new();
+                std::io::stdin().read_to_string(&mut s)?;
+                let (json_meta, json_title, json_body) =
+                    note_ops::parse_json_creation_input(&s, &config.zk_config)?;
+                overrides = json_meta;
+                title = json_title;
+                body = json_body;
+            }
+            // --meta flags override JSON metadata
+            for (k, v) in note_ops::parse_meta_overrides(&meta, &config.zk_config)? {
+                overrides.insert(k, v);
+            }
+            let path = note_ops::create_note(&config, id, &overrides, title, body).await?;
             println!("{}", path.display());
         }
         Command::Remove { id } => {
@@ -139,7 +156,8 @@ async fn main() -> anyhow::Result<()> {
             let parsed_toml = parser::find_toml_metadata_block(&content)
                 .and_then(|b| parser::parse_toml_metadata(&b.toml_content))
                 .unwrap_or_default();
-            let json = note_info::build_note_info_json(&id, &path, &header, &parsed_toml)?;
+            let json =
+                note_info::build_note_info_json(&id, &path, &header, &parsed_toml, &content)?;
             println!("{json}");
         }
     }

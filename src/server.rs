@@ -13,6 +13,7 @@ use crate::handlers::{
     code_actions, completion, definition, diagnostics, hover, inlay_hints, references,
 };
 use crate::index::NoteIndex;
+use crate::note_ops::MetaOverrides;
 use crate::{link_gen, note_ops, reconcile, watcher};
 
 pub struct ZkLspServer {
@@ -402,7 +403,8 @@ impl LanguageServer for ZkLspServer {
             }
             "zk.newNote" => {
                 let config = self.current_config().await;
-                match note_ops::create_note(&config, None).await {
+                match note_ops::create_note(&config, None, &MetaOverrides::new(), None, None).await
+                {
                     Ok(path) => {
                         info!("created note: {}", path.display());
                         let uri = Url::from_file_path(&path).ok();

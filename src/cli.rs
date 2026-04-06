@@ -24,6 +24,15 @@ pub enum Command {
         /// Custom 10-digit note ID (YYMMDDHHMM); defaults to current timestamp
         #[arg(long)]
         id: Option<String>,
+        /// Override metadata fields at creation time (KEY=VALUE).
+        /// VALUE is interpreted as a TOML literal; bare words are treated as strings.
+        /// Examples: --meta checklist-status=todo  --meta "keywords=[\"a\",\"b\"]"
+        #[arg(long = "meta", value_name = "KEY=VALUE")]
+        meta: Vec<String>,
+        /// Read a JSON object from stdin with optional "metadata" (object), "title" (string),
+        /// and "content" (string) keys. --meta flags take priority over JSON metadata.
+        #[arg(long)]
+        json: bool,
     },
     /// Delete a note and remove it from link.typ
     Remove {

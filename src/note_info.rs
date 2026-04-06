@@ -69,8 +69,12 @@ pub fn build_note_info_json(
     path: &Path,
     header: &NoteHeader,
     parsed: &ParsedToml,
+    content: &str,
 ) -> anyhow::Result<String> {
-    Ok(serde_json::to_string_pretty(&build_note_info_value(
-        id, path, header, parsed,
-    ))?)
+    let mut val = build_note_info_value(id, path, header, parsed);
+    val.as_object_mut().unwrap().insert(
+        "content".into(),
+        serde_json::Value::String(content.to_owned()),
+    );
+    Ok(serde_json::to_string_pretty(&val)?)
 }
