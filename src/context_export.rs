@@ -94,7 +94,13 @@ pub async fn export_context(
             let parsed_toml = parser::find_toml_metadata_block(&content)
                 .and_then(|b| parser::parse_toml_metadata(&b.toml_content))
                 .unwrap_or_default();
-            note_info::build_note_info_value(&id, &path, h, &parsed_toml)
+            note_info::build_note_info_value(
+                &id,
+                &path,
+                h,
+                &parsed_toml,
+                &config.zk_config.metadata.fields,
+            )
         });
 
         sections.push(NoteSection {

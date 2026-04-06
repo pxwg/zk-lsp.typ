@@ -69,6 +69,27 @@ pub struct MetadataConfig {
     pub fields: Vec<MetadataFieldConfig>,
 }
 
+/// Build a TOML table containing config-declared metadata defaults.
+///
+/// The shape mirrors the metadata TOML block. For example, a field declared as
+/// `user.priority` becomes `{ user = { priority = "normal" } }`.
+pub fn metadata_defaults_table(metadata_fields: &[MetadataFieldConfig]) -> toml::Table {
+    let mut defaults = toml::Table::new();
+    for field in metadata_fields {
+        let Some(sub_key) = field.path.strip_prefix("user.") else {
+            continue;
+        };
+        let user_entry = defaults
+            .entry("user".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let toml::Value::Table(user_table) = user_entry else {
+            continue;
+        };
+        user_table.insert(sub_key.to_string(), field.default.clone());
+    }
+    defaults
+}
+
 fn parse_metadata_config(table: &toml::Table) -> MetadataConfig {
     let fields_arr = match table
         .get("metadata")

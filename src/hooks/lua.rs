@@ -6,7 +6,7 @@ use super::types::{
     HookCheckbox, HookHeading, HookMetadataField, HookNoteInput, HookResult, HookSpan,
     HookTextEdit, HookTitle,
 };
-use crate::config::{MetadataFieldConfig, MetadataFieldKind};
+use crate::config::{metadata_defaults_table, MetadataFieldConfig, MetadataFieldKind};
 use crate::parser::{self, ChecklistItemKind};
 
 /// A loaded Lua hook script that exposes a `run(note) -> result` function.
@@ -239,23 +239,6 @@ fn toml_table_to_lua(lua: &Lua, table: &toml::Table) -> mlua::Result<mlua::Table
         t.set(k.as_str(), toml_value_to_lua(lua, v)?)?;
     }
     Ok(t)
-}
-
-fn metadata_defaults_table(metadata_fields: &[MetadataFieldConfig]) -> toml::Table {
-    let mut defaults = toml::Table::new();
-    for field in metadata_fields {
-        let Some(sub_key) = field.path.strip_prefix("user.") else {
-            continue;
-        };
-        let user_entry = defaults
-            .entry("user".to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        let toml::Value::Table(user_table) = user_entry else {
-            continue;
-        };
-        user_table.insert(sub_key.to_string(), field.default.clone());
-    }
-    defaults
 }
 
 fn note_input_to_lua(lua: &Lua, input: &HookNoteInput) -> anyhow::Result<mlua::Table> {

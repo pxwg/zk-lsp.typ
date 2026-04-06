@@ -156,8 +156,14 @@ async fn main() -> anyhow::Result<()> {
             let parsed_toml = parser::find_toml_metadata_block(&content)
                 .and_then(|b| parser::parse_toml_metadata(&b.toml_content))
                 .unwrap_or_default();
-            let json =
-                note_info::build_note_info_json(&id, &path, &header, &parsed_toml, &content)?;
+            let json = note_info::build_note_info_json(
+                &id,
+                &path,
+                &header,
+                &parsed_toml,
+                &config.zk_config.metadata.fields,
+                &content,
+            )?;
             println!("{json}");
         }
     }
