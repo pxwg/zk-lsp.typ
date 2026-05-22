@@ -44,11 +44,24 @@ impl ZkLspServer {
         self.config.read().await.clone()
     }
 
+    async fn document_in_scope(&self, uri: &Url) -> bool {
+        let Ok(path) = uri.to_file_path() else {
+            return false;
+        };
+        let config = self.current_config().await;
+        is_scoped_note_path(&config, &path)
+    }
+
     async fn publish_diagnostics(&self, uri: Url, content: &str) {
         let file_path = uri.to_file_path().unwrap_or_default();
+        let config = self.current_config().await;
+        if !is_scoped_note_path(&config, &file_path) {
+            self.client.publish_diagnostics(uri, Vec::new(), None).await;
+            return;
+        }
+
         let mut diags = diagnostics::get_diagnostics(content, &self.index, uri.path());
         diags.extend(diagnostics::get_schema_diagnostics(content, &self.index));
-        let config = self.current_config().await;
         if let Ok(reconcile_diags) =
             reconcile::collect_diagnostics(&config, Some((&file_path, content))).await
         {
@@ -139,9 +152,15 @@ impl LanguageServer for ZkLspServer {
                     info!("index built: {n} notes");
                     for (uri, content) in open_documents.read().await.iter() {
                         let file_path = uri.to_file_path().unwrap_or_default();
+                        let current_config = config.read().await.clone();
+                        if !is_scoped_note_path(&current_config, &file_path) {
+                            client
+                                .publish_diagnostics(uri.clone(), Vec::new(), None)
+                                .await;
+                            continue;
+                        }
                         let mut diags = diagnostics::get_diagnostics(content, &index, uri.path());
                         diags.extend(diagnostics::get_schema_diagnostics(content, &index));
-                        let current_config = config.read().await.clone();
                         if let Ok(reconcile_diags) = reconcile::collect_diagnostics(
                             &current_config,
                             Some((&file_path, content)),
@@ -186,6 +205,12 @@ impl LanguageServer for ZkLspServer {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.clone();
         let content = params.text_document.text;
+        if !self.document_in_scope(&uri).await {
+            self.open_documents.write().await.remove(&uri);
+            self.client.publish_diagnostics(uri, Vec::new(), None).await;
+            return;
+        }
+
         self.open_documents
             .write()
             .await
@@ -202,6 +227,12 @@ impl LanguageServer for ZkLspServer {
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
+        if !self.document_in_scope(&uri).await {
+            self.open_documents.write().await.remove(&uri);
+            self.client.publish_diagnostics(uri, Vec::new(), None).await;
+            return;
+        }
+
         let initial_content = self.read_document(&uri).await.unwrap_or_default();
         let updated_content = {
             let mut documents = self.open_documents.write().await;
@@ -215,6 +246,12 @@ impl LanguageServer for ZkLspServer {
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri.clone();
+        if !self.document_in_scope(&uri).await {
+            self.open_documents.write().await.remove(&uri);
+            self.client.publish_diagnostics(uri, Vec::new(), None).await;
+            return;
+        }
+
         let content = match params.text {
             Some(t) => t,
             None => match uri
@@ -251,6 +288,12 @@ impl LanguageServer for ZkLspServer {
         for change in params.changes {
             let uri = change.uri.clone();
             if let Ok(path) = uri.to_file_path() {
+                let config = self.current_config().await;
+                if !is_scoped_note_path(&config, &path) {
+                    self.client.publish_diagnostics(uri, Vec::new(), None).await;
+                    continue;
+                }
+
                 match change.typ {
                     FileChangeType::CREATED | FileChangeType::CHANGED => {
                         let _ = self.index.update_file(&path).await;
@@ -276,6 +319,10 @@ impl LanguageServer for ZkLspServer {
         params: GotoDefinitionParams,
     ) -> LspResult<Option<GotoDefinitionResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
+        if !self.document_in_scope(uri).await {
+            return Ok(None);
+        }
+
         let position = params.text_document_position_params.position;
         let content = self.read_document(uri).await.unwrap_or_default();
 
@@ -289,6 +336,10 @@ impl LanguageServer for ZkLspServer {
 
     async fn references(&self, params: ReferenceParams) -> LspResult<Option<Vec<Location>>> {
         let uri = &params.text_document_position.text_document.uri;
+        if !self.document_in_scope(uri).await {
+            return Ok(None);
+        }
+
         let row = params.text_document_position.position.line as usize;
         let content = match self.read_document(uri).await {
             Some(c) => c,
@@ -305,6 +356,10 @@ impl LanguageServer for ZkLspServer {
 
     async fn code_action(&self, params: CodeActionParams) -> LspResult<Option<CodeActionResponse>> {
         let uri = &params.text_document.uri;
+        if !self.document_in_scope(uri).await {
+            return Ok(None);
+        }
+
         let content = self.read_document(uri).await.unwrap_or_default();
         let mut actions = code_actions::get_code_actions(uri, &params.context.diagnostics);
         actions.extend(code_actions::get_metadata_actions(
@@ -321,6 +376,10 @@ impl LanguageServer for ZkLspServer {
 
     async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
         let uri = &params.text_document_position.text_document.uri;
+        if !self.document_in_scope(uri).await {
+            return Ok(None);
+        }
+
         let position = params.text_document_position.position;
         let content = self.read_document(uri).await.unwrap_or_default();
         let items = completion::get_completions(&content, position, &self.index);
@@ -337,6 +396,10 @@ impl LanguageServer for ZkLspServer {
 
     async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
         let uri = &params.text_document_position_params.text_document.uri;
+        if !self.document_in_scope(uri).await {
+            return Ok(None);
+        }
+
         let position = params.text_document_position_params.position;
         let content = self.read_document(uri).await.unwrap_or_default();
         Ok(hover::get_hover(&content, position, &self.index))
@@ -348,6 +411,10 @@ impl LanguageServer for ZkLspServer {
 
     async fn inlay_hint(&self, params: InlayHintParams) -> LspResult<Option<Vec<InlayHint>>> {
         let uri = &params.text_document.uri;
+        if !self.document_in_scope(uri).await {
+            return Ok(None);
+        }
+
         let content = match self.read_document(uri).await {
             Some(c) => c,
             None => return Ok(None),
@@ -462,6 +529,23 @@ impl LanguageServer for ZkLspServer {
     }
 }
 
+fn is_scoped_note_path(config: &WikiConfig, path: &std::path::Path) -> bool {
+    let note_dir = absolute_path(&config.note_dir);
+    let path = absolute_path(path);
+
+    path.extension().and_then(|e| e.to_str()) == Some("typ") && path.starts_with(&note_dir)
+}
+
+fn absolute_path(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(path)
+    }
+}
+
 fn apply_content_changes(content: &mut String, changes: &[TextDocumentContentChangeEvent]) {
     for change in changes {
         match change.range {
@@ -510,9 +594,31 @@ fn position_to_byte_offset(content: &str, position: Position) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_content_changes, position_to_byte_offset};
+    use super::{apply_content_changes, is_scoped_note_path, position_to_byte_offset};
+    use crate::config::WikiConfig;
     use crate::parser;
+    use std::path::PathBuf;
     use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+
+    #[test]
+    fn scoped_note_path_only_accepts_typst_files_under_note_dir() {
+        let root = PathBuf::from("/tmp/zk-lsp-scope-test/wiki");
+        let config = WikiConfig::from_root(root.clone());
+
+        assert!(is_scoped_note_path(
+            &config,
+            &root.join("note/2605220949.typ")
+        ));
+        assert!(!is_scoped_note_path(&config, &root.join("test/test.typ")));
+        assert!(!is_scoped_note_path(
+            &config,
+            &root.join("note/2605220949.md")
+        ));
+        assert!(!is_scoped_note_path(
+            &config,
+            &PathBuf::from("/tmp/zk-lsp-scope-test/wiki-notes/note/2605220949.typ")
+        ));
+    }
 
     #[test]
     fn apply_content_changes_updates_incremental_edits() {
