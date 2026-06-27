@@ -19,7 +19,6 @@ mod reconcile;
 mod server;
 mod watcher;
 
-use anyhow::Context;
 use clap::Parser;
 use tokio::sync::RwLock;
 use tower_lsp::{LspService, Server};
@@ -140,31 +139,12 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
-        Command::NoteInfo { id } => {
-            let path = config.note_dir.join(format!("{id}.typ"));
-            if !path.exists() {
-                eprintln!("Note {id} not found at {}", path.display());
-                std::process::exit(1);
-            }
-            let content = tokio::fs::read_to_string(&path)
-                .await
-                .with_context(|| format!("reading {}", path.display()))?;
-            let header = parser::parse_header(&content).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Failed to parse note {id} (may be legacy format; run zk-lsp migrate first)"
-                )
-            })?;
-            let parsed_toml = parser::find_toml_metadata_block(&content)
-                .and_then(|b| parser::parse_toml_metadata(&b.toml_content))
-                .unwrap_or_default();
-            let json = note_info::build_note_info_json(
-                &id,
-                &path,
-                &header,
-                &parsed_toml,
-                &config.zk_config.metadata.fields,
-                &content,
-            )?;
+        Command::Notes { json: _ } => {
+            let json = note_info::build_notes_json(&config).await?;
+            println!("{json}");
+        }
+        Command::NoteInfo { id, json: _ } => {
+            let json = note_info::build_single_note_info_json(&id, &config).await?;
             println!("{json}");
         }
         Command::Config { command } => {

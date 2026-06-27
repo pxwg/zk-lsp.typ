@@ -126,6 +126,7 @@ Commands:
   reconcile  Reconcile cross-file checkbox states [--dry-run]
   export     BFS context export for AI consumption [--depth N] [--inverse] [--simple]
   check      Graph integrity check: dead links + orphan notes
+  notes      Output all notes' metadata/search records as JSON
   note-info  Output a single note's metadata as JSON
   config     Inspect loaded zk-lsp configuration
 
@@ -163,6 +164,9 @@ zk-lsp check
 
 # Read a note's metadata as JSON (for scripts / AI agents)
 zk-lsp note-info 2602082037
+
+# Read all notes' canonical metadata/search records in one process
+zk-lsp notes --json
 
 # Inspect the metadata schema implied by defaults + loaded config
 zk-lsp config metadata fields --json --sources

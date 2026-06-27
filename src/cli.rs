@@ -72,6 +72,12 @@ pub enum Command {
         #[arg(long)]
         no_dead_links: bool,
     },
+    /// Output all notes' metadata/search records as JSON
+    Notes {
+        /// Output JSON (default; kept for explicit script usage)
+        #[arg(long)]
+        json: bool,
+    },
     /// Initialise a new wiki in the current directory (or --wiki-root)
     Init {
         /// Custom 10-digit note ID (YYMMDDHHMM) for the sample note; defaults to current timestamp
@@ -82,6 +88,9 @@ pub enum Command {
     NoteInfo {
         /// The 10-digit note ID (YYMMDDHHMM)
         id: String,
+        /// Output JSON (default; kept for explicit script usage)
+        #[arg(long)]
+        json: bool,
     },
     /// Inspect loaded zk-lsp configuration
     Config {
