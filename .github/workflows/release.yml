@@ -179,7 +179,7 @@ jobs:
               end
 
               test do
-                assert_match "zk-lsp", shell_output("\#{bin}/zk-lsp --help")
+                assert_match "zk-lsp", shell_output("#{{bin}}/zk-lsp --help")
               end
             end
           """)
