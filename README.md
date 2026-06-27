@@ -127,6 +127,7 @@ Commands:
   export     BFS context export for AI consumption [--depth N] [--inverse] [--simple]
   check      Graph integrity check: dead links + orphan notes
   note-info  Output a single note's metadata as JSON
+  config     Inspect loaded zk-lsp configuration
 
 Options:
   --wiki-root <PATH>   Override the wiki root directory
@@ -162,6 +163,11 @@ zk-lsp check
 
 # Read a note's metadata as JSON (for scripts / AI agents)
 zk-lsp note-info 2602082037
+
+# Inspect the metadata schema implied by defaults + loaded config
+zk-lsp config metadata fields --json --sources
+zk-lsp config metadata defaults --toml
+zk-lsp config metadata json-schema --json
 ```
 
 ## Configuration
@@ -196,6 +202,25 @@ path    = "user.priority"   # must be user.*
 kind    = "string"          # string | boolean | array-string
 default = "normal"
 ```
+
+### Metadata schema introspection
+
+The `config metadata` command family prints the built-in metadata fields plus
+custom fields from the merged user/project configuration:
+
+```bash
+zk-lsp config metadata fields       # JSON field specs (default output)
+zk-lsp config metadata defaults     # JSON default metadata tree
+zk-lsp config metadata json-schema  # JSON Schema draft 2020-12
+
+zk-lsp config metadata fields --toml
+zk-lsp config metadata defaults --toml
+zk-lsp config metadata fields --sources
+```
+
+`--sources` adds a stable source list showing the user/project config paths and
+whether each file was readable and parsed as TOML. For `json-schema`, this lives
+under the `x-zk-lsp` extension key so the output remains a JSON Schema.
 
 ### Lua hooks
 

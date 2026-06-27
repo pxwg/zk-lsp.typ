@@ -74,6 +74,8 @@ pub mod init;
 #[doc(hidden)]
 pub mod link_gen;
 #[doc(hidden)]
+pub mod metadata_schema;
+#[doc(hidden)]
 pub mod migrate;
 #[doc(hidden)]
 pub mod note_info;

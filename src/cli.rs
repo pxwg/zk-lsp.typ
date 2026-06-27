@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "zk-lsp", about = "Zettelkasten LSP server and CLI tools")]
@@ -83,4 +83,60 @@ pub enum Command {
         /// The 10-digit note ID (YYMMDDHHMM)
         id: String,
     },
+    /// Inspect loaded zk-lsp configuration
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommand {
+    /// Output metadata schema/defaults derived from built-in fields and loaded config
+    Metadata {
+        #[command(subcommand)]
+        command: MetadataCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MetadataCommand {
+    /// Output metadata field declarations (core + configured custom fields)
+    Fields {
+        #[command(flatten)]
+        output: MetadataOutputArgs,
+    },
+    /// Output the default metadata tree used for new notes
+    Defaults {
+        #[command(flatten)]
+        output: MetadataOutputArgs,
+    },
+    /// Output a JSON Schema for known metadata fields
+    JsonSchema {
+        #[command(flatten)]
+        output: JsonSchemaOutputArgs,
+    },
+}
+
+#[derive(Args)]
+pub struct MetadataOutputArgs {
+    /// Output JSON (default)
+    #[arg(long, conflicts_with = "toml")]
+    pub json: bool,
+    /// Output TOML instead of JSON
+    #[arg(long)]
+    pub toml: bool,
+    /// Include user/project config source paths and loaded status
+    #[arg(long)]
+    pub sources: bool,
+}
+
+#[derive(Args)]
+pub struct JsonSchemaOutputArgs {
+    /// Output JSON (default)
+    #[arg(long)]
+    pub json: bool,
+    /// Include user/project config source paths and loaded status in x-zk-lsp
+    #[arg(long)]
+    pub sources: bool,
 }

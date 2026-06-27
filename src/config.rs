@@ -14,6 +14,17 @@ use std::path::{Path, PathBuf};
 
 use tower_lsp::lsp_types::{InitializeParams, Url};
 
+/// A config file location that participates in normal load order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSourceInfo {
+    /// Scope name: `user` or `project`.
+    pub scope: &'static str,
+    /// Absolute or root-relative path used by the loader.
+    pub path: PathBuf,
+    /// `true` when the file was readable and parsed as TOML by the loader.
+    pub loaded: bool,
+}
+
 /// Core TOML metadata fields that cannot be overridden by user-defined fields.
 const CORE_METADATA_FIELDS: &[&str] = &[
     "schema-version",
@@ -334,7 +345,7 @@ pub struct ZkLspConfig {
 }
 
 impl ZkLspConfig {
-    fn user_config_path() -> PathBuf {
+    pub fn user_config_path() -> PathBuf {
         let base = std::env::var("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
@@ -343,6 +354,24 @@ impl ZkLspConfig {
                     .unwrap_or_else(|_| PathBuf::from(".config"))
             });
         base.join("zk-lsp").join("config.toml")
+    }
+
+    /// Return the user and project config sources in load order.
+    pub fn source_infos(wiki_root: &Path) -> Vec<ConfigSourceInfo> {
+        let user_path = Self::user_config_path();
+        let project_path = wiki_root.join("zk-lsp.toml");
+        vec![
+            ConfigSourceInfo {
+                scope: "user",
+                loaded: config_file_loaded(&user_path),
+                path: user_path,
+            },
+            ConfigSourceInfo {
+                scope: "project",
+                loaded: config_file_loaded(&project_path),
+                path: project_path,
+            },
+        ]
     }
 
     fn from_path(path: &Path) -> Self {
@@ -461,6 +490,13 @@ impl WikiConfig {
                     .and_then(|folder| url_to_path(&folder.uri))
             })
     }
+}
+
+fn config_file_loaded(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    raw.parse::<toml::Table>().is_ok()
 }
 
 fn parse_root_dir_value(value: &serde_json::Value) -> Option<PathBuf> {

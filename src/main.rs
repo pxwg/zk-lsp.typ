@@ -10,6 +10,7 @@ mod hooks;
 mod index;
 mod init;
 mod link_gen;
+mod metadata_schema;
 mod migrate;
 mod note_info;
 mod note_ops;
@@ -24,7 +25,7 @@ use tokio::sync::RwLock;
 use tower_lsp::{LspService, Server};
 use tracing_subscriber::{fmt, EnvFilter};
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, ConfigCommand, MetadataCommand};
 use config::WikiConfig;
 use server::ZkLspServer;
 
@@ -166,8 +167,40 @@ async fn main() -> anyhow::Result<()> {
             )?;
             println!("{json}");
         }
+        Command::Config { command } => {
+            let out = render_config_command(&config, command)?;
+            print!("{out}");
+        }
     }
     Ok(())
+}
+
+fn render_config_command(config: &WikiConfig, command: ConfigCommand) -> anyhow::Result<String> {
+    match command {
+        ConfigCommand::Metadata { command } => match command {
+            MetadataCommand::Fields { output } => metadata_schema::render_fields(
+                config,
+                metadata_output_format(output.toml),
+                output.sources,
+            ),
+            MetadataCommand::Defaults { output } => metadata_schema::render_defaults(
+                config,
+                metadata_output_format(output.toml),
+                output.sources,
+            ),
+            MetadataCommand::JsonSchema { output } => {
+                metadata_schema::render_json_schema(config, output.sources)
+            }
+        },
+    }
+}
+
+fn metadata_output_format(toml: bool) -> metadata_schema::MetadataSchemaFormat {
+    if toml {
+        metadata_schema::MetadataSchemaFormat::Toml
+    } else {
+        metadata_schema::MetadataSchemaFormat::Json
+    }
 }
 
 async fn run_lsp(cli_root: Option<std::path::PathBuf>) -> anyhow::Result<()> {
