@@ -2,27 +2,27 @@ class ZkLsp < Formula
   desc "Zettelkasten LSP server and CLI tools for Typst-based wikis"
   homepage "https://github.com/pxwg/zk-lsp.typ"
   license "AGPL-3.0"
-  version "0.5.1"
+  version "0.5.2"
 
   on_macos do
     on_arm do
-      url "https://github.com/pxwg/zk-lsp.typ/releases/download/v0.5.1/zk-lsp-aarch64-apple-darwin.tar.gz"
-      sha256 "a463f251ac9e6112513d7e5572d7d57495713882d5a732e6213ee52328595e78"
+      url "https://github.com/pxwg/zk-lsp.typ/releases/download/v0.5.2/zk-lsp-aarch64-apple-darwin.tar.gz"
+      sha256 "b07fc4dcd995019faa39debd4a10e47ec4174a80ea9253a2acfdc12ae46c6dec"
     end
     on_intel do
-      url "https://github.com/pxwg/zk-lsp.typ/releases/download/v0.5.1/zk-lsp-x86_64-apple-darwin.tar.gz"
-      sha256 "9989f559650355720a7c075238c7212aa2e3694e67f7c72b86bd43ea747a90c4"
+      url "https://github.com/pxwg/zk-lsp.typ/releases/download/v0.5.2/zk-lsp-x86_64-apple-darwin.tar.gz"
+      sha256 "8d3357d6ceab10fa2c50231c9438c8583d848f873da59975052fdec9fbe4bcca"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/pxwg/zk-lsp.typ/releases/download/v0.5.1/zk-lsp-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "e979c5043732454022aa61c58483e42805a6785fd2493acc4999c70a3dd72b31"
+      url "https://github.com/pxwg/zk-lsp.typ/releases/download/v0.5.2/zk-lsp-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "74b436f6a2458c6f57ac919cbfd8f29764df051dd48d347f03d721175bcd91e8"
     end
     on_intel do
-      url "https://github.com/pxwg/zk-lsp.typ/releases/download/v0.5.1/zk-lsp-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "d09c3e6c7c971a2da4edaac92be8e6537dda01e6eb900df0ab7060da7d6b83c3"
+      url "https://github.com/pxwg/zk-lsp.typ/releases/download/v0.5.2/zk-lsp-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "8adcdca9b3edfc414bb264dde15c3cf72defce003faccc4095924576821b0875"
     end
   end
 
@@ -31,6 +31,6 @@ class ZkLsp < Formula
   end
 
   test do
-    assert_match "zk-lsp", shell_output("\#<built-in function bin>/zk-lsp --help")
+    assert_match "zk-lsp", shell_output("#{bin}/zk-lsp --help")
   end
 end
