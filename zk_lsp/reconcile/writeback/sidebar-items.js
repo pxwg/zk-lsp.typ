@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["apply_tag_edit","compute_tag_edit","get_todo_state","is_note_done","is_note_done_with_deps","is_todo_line","normalize_note","normalize_note_from_checked","replace_todo_state","update_nested_checkboxes","update_ref_checkboxes_by_line","update_ref_checkboxes_sync"],"static":["RE_TODO_ID"]};
