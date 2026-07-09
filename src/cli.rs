@@ -90,6 +90,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Read or update one note's metadata record
+    Metadata {
+        #[command(subcommand)]
+        command: NoteMetadataCommand,
+    },
     /// Inspect loaded zk-lsp configuration
     Config {
         #[command(subcommand)]
@@ -102,12 +107,12 @@ pub enum ConfigCommand {
     /// Output metadata schema/defaults derived from built-in fields and loaded config
     Metadata {
         #[command(subcommand)]
-        command: MetadataCommand,
+        command: ConfigMetadataCommand,
     },
 }
 
 #[derive(Subcommand)]
-pub enum MetadataCommand {
+pub enum ConfigMetadataCommand {
     /// Output metadata field declarations (core + configured custom fields)
     Fields {
         #[command(flatten)]
@@ -123,6 +128,54 @@ pub enum MetadataCommand {
         #[command(flatten)]
         output: JsonSchemaOutputArgs,
     },
+}
+
+#[derive(Subcommand)]
+pub enum NoteMetadataCommand {
+    /// Create or complete the metadata record for an existing note
+    Create {
+        /// The 10-digit note ID (YYMMDDHHMM)
+        id: String,
+    },
+    /// Output one note's metadata record
+    Get {
+        /// The 10-digit note ID (YYMMDDHHMM)
+        id: String,
+        #[command(flatten)]
+        output: NoteMetadataOutputArgs,
+    },
+    /// Update fields in one complete metadata record
+    Set {
+        /// The 10-digit note ID (YYMMDDHHMM)
+        id: String,
+        /// Metadata field assignments. VALUE is interpreted as a TOML literal;
+        /// bare words are treated as strings.
+        #[arg(
+            value_name = "KEY=VALUE",
+            num_args = 1..,
+            required = true,
+            allow_hyphen_values = true
+        )]
+        fields: Vec<String>,
+    },
+    /// Reset fields in one complete metadata record to their defaults
+    Reset {
+        /// The 10-digit note ID (YYMMDDHHMM)
+        id: String,
+        /// Metadata field names to reset
+        #[arg(value_name = "FIELD", num_args = 1.., required = true)]
+        fields: Vec<String>,
+    },
+}
+
+#[derive(Args)]
+pub struct NoteMetadataOutputArgs {
+    /// Output JSON (default)
+    #[arg(long, conflicts_with = "toml")]
+    pub json: bool,
+    /// Output TOML instead of JSON
+    #[arg(long)]
+    pub toml: bool,
 }
 
 #[derive(Args)]

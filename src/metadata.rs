@@ -21,6 +21,16 @@ pub const CORE_FIELDS: &[&str] = &[
     "relation-target",
 ];
 
+pub const USER_WRITABLE_CORE_FIELDS: &[&str] = &[
+    "aliases",
+    "abstract",
+    "keywords",
+    "generated",
+    "checklist-status",
+    "relation",
+    "relation-target",
+];
+
 #[derive(Debug, Clone)]
 pub struct MetadataRecord {
     pub schema_version: u32,
@@ -548,6 +558,16 @@ pub async fn read_record(config: &crate::config::WikiConfig, id: &str) -> Result
     parse_record_for_read(&table, &config.zk_config.metadata.fields)
 }
 
+pub async fn read_valid_record_table(
+    config: &crate::config::WikiConfig,
+    id: &str,
+) -> Result<toml::Table> {
+    anyhow::ensure!(is_note_id(id), "Invalid note ID");
+    let table = read_record_table(config, id).await?;
+    validate_record_table_for_read(&table, &config.zk_config.metadata.fields)?;
+    Ok(canonical_record_table(&table))
+}
+
 pub async fn read_records(
     config: &crate::config::WikiConfig,
 ) -> Result<HashMap<String, MetadataRecord>> {
@@ -582,6 +602,72 @@ pub async fn patch_record(
     complete_record_table(&mut table, &config.zk_config);
     apply_patch_to_table(&mut table, patch, &config.zk_config.metadata.fields)?;
     put_record_table(config, id, &table).await
+}
+
+pub async fn complete_record_for_existing_note(
+    config: &crate::config::WikiConfig,
+    id: &str,
+) -> Result<()> {
+    anyhow::ensure!(is_note_id(id), "Invalid note ID");
+    let note_path = config.note_dir.join(format!("{id}.typ"));
+    let note_exists = fs::metadata(&note_path)
+        .await
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false);
+    anyhow::ensure!(note_exists, "Note does not exist");
+
+    let mut table = match read_record_table(config, id).await {
+        Ok(table) => {
+            match validate_record_table_for_read(&table, &config.zk_config.metadata.fields) {
+                Ok(()) => return Ok(()),
+                Err(err) if is_incomplete_record_error(&err) => table,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(err) if is_missing_record_error(&err) || is_missing_metadata_file_error(&err) => {
+            default_record_table(&config.zk_config)
+        }
+        Err(err) => return Err(err),
+    };
+    complete_record_table(&mut table, &config.zk_config);
+    validate_record_table_for_read(&table, &config.zk_config.metadata.fields)?;
+    put_record_table(config, id, &table).await
+}
+
+pub async fn patch_valid_record(
+    config: &crate::config::WikiConfig,
+    id: &str,
+    patch: &HashMap<String, toml::Value>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !patch.is_empty(),
+        "metadata set requires at least one field"
+    );
+    for key in patch.keys() {
+        validate_user_writable_field(key, &config.zk_config.metadata.fields)?;
+    }
+    let mut table = read_valid_record_table(config, id).await?;
+    apply_patch_to_table(&mut table, patch, &config.zk_config.metadata.fields)?;
+    validate_record_table_for_read(&table, &config.zk_config.metadata.fields)?;
+    put_record_table(config, id, &table).await
+}
+
+pub async fn reset_valid_record_fields(
+    config: &crate::config::WikiConfig,
+    id: &str,
+    fields: &[String],
+) -> Result<()> {
+    anyhow::ensure!(
+        !fields.is_empty(),
+        "metadata reset requires at least one field"
+    );
+    let patch: HashMap<String, toml::Value> = fields
+        .iter()
+        .map(|field| {
+            default_user_writable_field_value(config, field).map(|value| (field.clone(), value))
+        })
+        .collect::<Result<_>>()?;
+    patch_valid_record(config, id, &patch).await
 }
 
 pub async fn put_record_table(
@@ -625,6 +711,11 @@ fn empty_index_table() -> toml::Table {
 fn is_missing_record_error(err: &anyhow::Error) -> bool {
     err.chain()
         .any(|cause| cause.to_string() == "Missing metadata for current note")
+}
+
+fn is_incomplete_record_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string() == "Metadata record is incomplete")
 }
 
 fn is_missing_metadata_file_error(err: &anyhow::Error) -> bool {
@@ -687,6 +778,43 @@ fn validate_patch_entry(
         }
     }
     anyhow::bail!("unknown metadata field '{key}'")
+}
+
+fn validate_user_writable_field(key: &str, metadata_fields: &[MetadataFieldConfig]) -> Result<()> {
+    if USER_WRITABLE_CORE_FIELDS.contains(&key) {
+        return Ok(());
+    }
+    if CORE_FIELDS.contains(&key) {
+        anyhow::bail!("metadata field '{key}' is managed by zk-lsp")
+    }
+    if key.starts_with("user.")
+        && metadata_fields
+            .iter()
+            .any(|field| field.path.as_str() == key)
+    {
+        return Ok(());
+    }
+    anyhow::bail!("unknown metadata field '{key}'")
+}
+
+fn default_user_writable_field_value(
+    config: &crate::config::WikiConfig,
+    key: &str,
+) -> Result<toml::Value> {
+    validate_user_writable_field(key, &config.zk_config.metadata.fields)?;
+    let defaults = default_record_table(&config.zk_config);
+    if let Some(user_key) = key.strip_prefix("user.") {
+        return defaults
+            .get("user")
+            .and_then(|value| value.as_table())
+            .and_then(|user| user.get(user_key))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown metadata field '{key}'"));
+    }
+    defaults
+        .get(key)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("unknown metadata field '{key}'"))
 }
 
 fn validate_core_value(key: &str, value: &toml::Value) -> Result<()> {
@@ -1210,6 +1338,326 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Missing format-version"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn test_config(root: std::path::PathBuf) -> WikiConfig {
+        let mut config = WikiConfig::from_root(root);
+        config.zk_config.metadata.fields = vec![MetadataFieldConfig {
+            path: "user.project".into(),
+            kind: MetadataFieldKind::String,
+            default: toml::Value::String("default-project".into()),
+        }];
+        config
+    }
+
+    fn write_note_file(config: &WikiConfig, id: &str) {
+        std::fs::create_dir_all(&config.note_dir).unwrap();
+        std::fs::write(
+            config.note_dir.join(format!("{id}.typ")),
+            format!("= Test <{id}>\n"),
+        )
+        .unwrap();
+    }
+
+    fn write_index_with_record(root: &std::path::Path, id: &str, record: toml::Table) {
+        let mut notes = toml::Table::new();
+        notes.insert(id.to_string(), toml::Value::Table(record));
+        let root_table = toml::Table::from_iter([
+            (
+                "format-version".to_string(),
+                toml::Value::Integer(FORMAT_VERSION),
+            ),
+            ("notes".to_string(), toml::Value::Table(notes)),
+        ]);
+        std::fs::write(metadata_path(root), render_index(&root_table)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_record_for_existing_note_creates_missing_record() {
+        let root =
+            std::env::temp_dir().join(format!("zk-lsp-metadata-create-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let config = test_config(root.clone());
+        write_note_file(&config, "2607081902");
+
+        complete_record_for_existing_note(&config, "2607081902")
+            .await
+            .unwrap();
+
+        let table = read_valid_record_table(&config, "2607081902")
+            .await
+            .unwrap();
+        assert_eq!(
+            table
+                .get("user")
+                .and_then(|value| value.as_table())
+                .and_then(|user| user.get("project"))
+                .and_then(|value| value.as_str()),
+            Some("default-project")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn complete_record_for_existing_note_preserves_existing_values() {
+        let root = std::env::temp_dir().join(format!(
+            "zk-lsp-metadata-complete-preserve-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config = test_config(root.clone());
+        write_note_file(&config, "2607081902");
+        let mut record = toml::Table::new();
+        record.insert("relation".into(), toml::Value::String("archived".into()));
+        record.insert(
+            "user".into(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "project".to_string(),
+                toml::Value::String("manual-project".into()),
+            )])),
+        );
+        write_index_with_record(&root, "2607081902", record);
+
+        complete_record_for_existing_note(&config, "2607081902")
+            .await
+            .unwrap();
+
+        let table = read_valid_record_table(&config, "2607081902")
+            .await
+            .unwrap();
+        assert_eq!(
+            table.get("relation").and_then(|value| value.as_str()),
+            Some("archived")
+        );
+        assert_eq!(
+            table
+                .get("user")
+                .and_then(|value| value.as_table())
+                .and_then(|user| user.get("project"))
+                .and_then(|value| value.as_str()),
+            Some("manual-project")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn complete_record_for_existing_note_rejects_invalid_values_without_writing() {
+        let root = std::env::temp_dir().join(format!(
+            "zk-lsp-metadata-complete-invalid-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config = test_config(root.clone());
+        write_note_file(&config, "2607081902");
+        let mut record = default_record_table(&config.zk_config);
+        record.insert(
+            "checklist-status".into(),
+            toml::Value::String("blocked".into()),
+        );
+        write_index_with_record(&root, "2607081902", record);
+        let before = std::fs::read_to_string(metadata_path(&root)).unwrap();
+
+        let err = complete_record_for_existing_note(&config, "2607081902")
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "Invalid metadata for current note");
+        assert_eq!(
+            std::fs::read_to_string(metadata_path(&root)).unwrap(),
+            before
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn complete_record_for_existing_note_requires_existing_note_file() {
+        let root = std::env::temp_dir().join(format!(
+            "zk-lsp-metadata-create-missing-note-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config = test_config(root.clone());
+
+        let err = complete_record_for_existing_note(&config, "2607081902")
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "Note does not exist");
+        assert!(!metadata_path(&root).exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn patch_valid_record_rejects_incomplete_record() {
+        let root = std::env::temp_dir().join(format!(
+            "zk-lsp-metadata-strict-patch-incomplete-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config = test_config(root.clone());
+        write_note_file(&config, "2607081902");
+        let mut record = default_record_table(&config.zk_config);
+        record.remove("keywords");
+        write_index_with_record(&root, "2607081902", record);
+        let before = std::fs::read_to_string(metadata_path(&root)).unwrap();
+        let patch = HashMap::from([(
+            "relation".to_string(),
+            toml::Value::String("archived".into()),
+        )]);
+
+        let err = patch_valid_record(&config, "2607081902", &patch)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "Metadata record is incomplete");
+        assert_eq!(
+            std::fs::read_to_string(metadata_path(&root)).unwrap(),
+            before
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn patch_valid_record_rejects_schema_version_update() {
+        let root = std::env::temp_dir().join(format!(
+            "zk-lsp-metadata-strict-patch-schema-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config = test_config(root.clone());
+        write_note_file(&config, "2607081902");
+        write_index_with_record(&root, "2607081902", default_record_table(&config.zk_config));
+        let patch = HashMap::from([("schema-version".to_string(), toml::Value::Integer(1))]);
+
+        let err = patch_valid_record(&config, "2607081902", &patch)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "metadata field 'schema-version' is managed by zk-lsp"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn patch_valid_record_requires_at_least_one_field() {
+        let root = std::env::temp_dir().join(format!(
+            "zk-lsp-metadata-strict-patch-empty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config = test_config(root.clone());
+        write_note_file(&config, "2607081902");
+        write_index_with_record(&root, "2607081902", default_record_table(&config.zk_config));
+        let patch = HashMap::new();
+
+        let err = patch_valid_record(&config, "2607081902", &patch)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "metadata set requires at least one field");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn patch_valid_record_rejects_whole_update_when_one_value_is_invalid() {
+        let root = std::env::temp_dir().join(format!(
+            "zk-lsp-metadata-strict-patch-atomic-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config = test_config(root.clone());
+        write_note_file(&config, "2607081902");
+        write_index_with_record(&root, "2607081902", default_record_table(&config.zk_config));
+        let before = std::fs::read_to_string(metadata_path(&root)).unwrap();
+        let patch = HashMap::from([
+            (
+                "relation".to_string(),
+                toml::Value::String("archived".into()),
+            ),
+            (
+                "checklist-status".to_string(),
+                toml::Value::String("blocked".into()),
+            ),
+        ]);
+
+        let err = patch_valid_record(&config, "2607081902", &patch)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "invalid metadata value for 'checklist-status'"
+        );
+        assert_eq!(
+            std::fs::read_to_string(metadata_path(&root)).unwrap(),
+            before
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn reset_valid_record_fields_restores_defaults() {
+        let root = std::env::temp_dir().join(format!(
+            "zk-lsp-metadata-reset-default-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config = test_config(root.clone());
+        write_note_file(&config, "2607081902");
+        let mut record = default_record_table(&config.zk_config);
+        record.insert("relation".into(), toml::Value::String("archived".into()));
+        record.insert(
+            "user".into(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "project".to_string(),
+                toml::Value::String("manual-project".into()),
+            )])),
+        );
+        write_index_with_record(&root, "2607081902", record);
+
+        reset_valid_record_fields(
+            &config,
+            "2607081902",
+            &["relation".to_string(), "user.project".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let table = read_valid_record_table(&config, "2607081902")
+            .await
+            .unwrap();
+        assert_eq!(
+            table.get("relation").and_then(|value| value.as_str()),
+            Some("active")
+        );
+        assert_eq!(
+            table
+                .get("user")
+                .and_then(|value| value.as_table())
+                .and_then(|user| user.get("project"))
+                .and_then(|value| value.as_str()),
+            Some("default-project")
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

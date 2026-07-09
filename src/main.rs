@@ -24,7 +24,7 @@ use tokio::sync::RwLock;
 use tower_lsp::{LspService, Server};
 use tracing_subscriber::{fmt, EnvFilter};
 
-use cli::{Cli, Command, ConfigCommand, MetadataCommand};
+use cli::{Cli, Command, ConfigCommand, ConfigMetadataCommand, NoteMetadataCommand};
 use config::WikiConfig;
 use server::ZkLspServer;
 
@@ -139,6 +139,9 @@ async fn main() -> anyhow::Result<()> {
             let json = note_info::build_single_note_info_json(&id, &config).await?;
             println!("{json}");
         }
+        Command::Metadata { command } => {
+            run_note_metadata_command(&config, command).await?;
+        }
         Command::Config { command } => {
             let out = render_config_command(&config, command)?;
             print!("{out}");
@@ -150,20 +153,74 @@ async fn main() -> anyhow::Result<()> {
 fn render_config_command(config: &WikiConfig, command: ConfigCommand) -> anyhow::Result<String> {
     match command {
         ConfigCommand::Metadata { command } => match command {
-            MetadataCommand::Fields { output } => metadata_schema::render_fields(
+            ConfigMetadataCommand::Fields { output } => metadata_schema::render_fields(
                 config,
                 metadata_output_format(output.toml),
                 output.sources,
             ),
-            MetadataCommand::Defaults { output } => metadata_schema::render_defaults(
+            ConfigMetadataCommand::Defaults { output } => metadata_schema::render_defaults(
                 config,
                 metadata_output_format(output.toml),
                 output.sources,
             ),
-            MetadataCommand::JsonSchema { output } => {
+            ConfigMetadataCommand::JsonSchema { output } => {
                 metadata_schema::render_json_schema(config, output.sources)
             }
         },
+    }
+}
+
+async fn run_note_metadata_command(
+    config: &WikiConfig,
+    command: NoteMetadataCommand,
+) -> anyhow::Result<()> {
+    match command {
+        NoteMetadataCommand::Create { id } => {
+            metadata::complete_record_for_existing_note(config, &id).await?;
+            eprintln!("Metadata record {id} created or completed.");
+        }
+        NoteMetadataCommand::Get { id, output } => {
+            let table = metadata::read_valid_record_table(config, &id).await?;
+            if output.toml {
+                print!("{}", toml::to_string_pretty(&table)?);
+            } else {
+                let value = toml_table_to_json(&table);
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            }
+        }
+        NoteMetadataCommand::Set { id, fields } => {
+            let patch = note_ops::parse_meta_overrides(&fields, &config.zk_config)?;
+            metadata::patch_valid_record(config, &id, &patch).await?;
+            eprintln!("Metadata record {id} updated.");
+        }
+        NoteMetadataCommand::Reset { id, fields } => {
+            metadata::reset_valid_record_fields(config, &id, &fields).await?;
+            eprintln!("Metadata record {id} reset.");
+        }
+    }
+    Ok(())
+}
+
+fn toml_table_to_json(table: &toml::Table) -> serde_json::Value {
+    serde_json::Value::Object(
+        table
+            .iter()
+            .map(|(key, value)| (key.clone(), toml_value_to_json(value)))
+            .collect(),
+    )
+}
+
+fn toml_value_to_json(value: &toml::Value) -> serde_json::Value {
+    match value {
+        toml::Value::String(s) => serde_json::Value::String(s.clone()),
+        toml::Value::Integer(n) => serde_json::json!(n),
+        toml::Value::Float(n) => serde_json::json!(n),
+        toml::Value::Boolean(b) => serde_json::json!(b),
+        toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
+        toml::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(toml_value_to_json).collect())
+        }
+        toml::Value::Table(table) => toml_table_to_json(table),
     }
 }
 
