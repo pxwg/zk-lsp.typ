@@ -330,7 +330,7 @@ pub struct ZkLspConfig {
     ///
     /// Supports two placeholders:
     /// - `{{id}}` — the 10-digit timestamp ID
-    /// - `{{metadata}}` — the standard TOML metadata block
+    /// - `{{metadata}}` — the standard `zk_metadata("ID")` binding
     pub new_note_template: Option<String>,
     /// User-defined metadata fields added to new notes.
     pub metadata: MetadataConfig,

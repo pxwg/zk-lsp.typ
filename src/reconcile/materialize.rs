@@ -28,6 +28,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::metadata::MetadataRecord;
+    use crate::parser::{ChecklistStatus, Relation};
     use crate::reconcile::default_module::DEFAULT_MODULE;
     use crate::reconcile::eval::eval_all;
     use crate::reconcile::observe::WorkspaceSnapshot;
@@ -37,15 +39,7 @@ mod tests {
     #[test]
     fn v1_identity() {
         let content = "#import \"../include.typ\": *\n\
-             #let zk-metadata = toml(bytes(\n\
-             \x20 ```toml\n\
-             \x20 schema-version = 1\n\
-             \x20 title = \"Test\"\n\
-             \x20 tags = []\n\
-             \x20 checklist-status = \"done\"\n\
-             \x20 generated = false\n\
-             \x20 ```.text,\n\
-             ))\n\
+             #let zk-metadata = zk_metadata(\"1111111111\")\n\
              #show: zettel.with(metadata: zk-metadata)\n\
              \n\
              = Test <1111111111>\n";
@@ -55,7 +49,18 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let snap = WorkspaceSnapshot::from_note_map(&map);
+        let metadata_records = [(
+            "1111111111".to_string(),
+            MetadataRecord {
+                checklist_status: ChecklistStatus::Done,
+                relation: Relation::Active,
+                ..MetadataRecord::default()
+            },
+        )]
+        .into_iter()
+        .collect();
+        let snap =
+            WorkspaceSnapshot::from_note_map_with_metadata_records(&map, &metadata_records, &[]);
         let module = parse_module(DEFAULT_MODULE).expect("parse");
         let eval_result = eval_all(&module, &snap);
 

@@ -14,8 +14,14 @@ use crate::note_ops;
 /// Extend this file freely with your own imports and styling.
 const INCLUDE_TYP: &str = r#"// zk-lsp include — extend with your own imports and styling
 
+/// Central metadata index, keyed by note ID.
+#let zk-metadata-db = toml("metadata.toml").notes
+
+/// Return metadata for one note ID.
+#let zk_metadata(id) = zk-metadata-db.at(id)
+
 /// Render a single zettel.
-/// `metadata` is the TOML-parsed table from the note header.
+/// `metadata` is the TOML-parsed record from metadata.toml.
 #let zettel(metadata: none, body) = body
 
 /// Include one note into the compiled document.

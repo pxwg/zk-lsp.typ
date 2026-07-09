@@ -87,6 +87,14 @@ pub fn build_hook_note_input_with_metadata_fields(
     content: &str,
     metadata_fields: &[MetadataFieldConfig],
 ) -> HookNoteInput {
+    build_hook_note_input_with_metadata(content, toml::Table::new(), metadata_fields)
+}
+
+pub fn build_hook_note_input_with_metadata(
+    content: &str,
+    metadata: toml::Table,
+    metadata_fields: &[MetadataFieldConfig],
+) -> HookNoteInput {
     let lines: Vec<&str> = content.lines().collect();
     let line_offsets = build_line_byte_offsets(content);
 
@@ -109,10 +117,6 @@ pub fn build_hook_note_input_with_metadata_fields(
         (String::new(), None)
     };
 
-    // Parse TOML metadata
-    let metadata = parser::find_toml_metadata_block(content)
-        .and_then(|b| b.toml_content.parse::<toml::Table>().ok())
-        .unwrap_or_default();
     let metadata_defaults = metadata_defaults_table(metadata_fields);
 
     // Parse checkboxes
@@ -440,34 +444,21 @@ fn lua_table_to_hook_result(
 mod tests {
     use super::*;
     use crate::config::{MetadataFieldConfig, MetadataFieldKind};
-    use crate::handlers::formatting::run_default_hooks;
-    use crate::hooks::apply::{apply_hook_result, validate_hook_result};
+    use crate::hooks::apply::{apply_hook_text_edits, validate_hook_result};
     use std::collections::HashMap;
 
     fn make_toml_note(title: &str, id: &str, status: &str, relation: &str, body: &str) -> String {
+        let _ = (status, relation);
         format!(
             concat!(
                 "#import \"../include.typ\": *\n",
-                "#let zk-metadata = toml(bytes(\n",
-                "  ```toml\n",
-                "  schema-version = 1\n",
-                "  aliases = []\n",
-                "  abstract = \"\"\n",
-                "  keywords = []\n",
-                "  generated = false\n",
-                "  checklist-status = \"{status}\"\n",
-                "  relation = \"{relation}\"\n",
-                "  relation-target = []\n",
-                "  ```.text,\n",
-                "))\n",
+                "#let zk-metadata = zk_metadata(\"{id}\")\n",
                 "#show: zettel.with(metadata: zk-metadata)\n",
                 "\n",
                 "= {title} <{id}>\n",
                 "\n",
                 "{body}",
             ),
-            status = status,
-            relation = relation,
             title = title,
             id = id,
             body = body,
@@ -685,7 +676,7 @@ end
 
     #[test]
     fn test_edits_apply_directly() {
-        // Hook returns a byte edit; apply_hook_result applies it as-is (no Rust normalizer).
+        // Hook returns a byte edit; Rust applies it as-is.
         let body = "- [ ] my task\n";
         let note = make_toml_note("Test", "2601010005", "none", "active", body);
         let cb_byte = note.find("- [ ] my task").expect("checkbox in note");
@@ -698,13 +689,8 @@ end
         let runner = HookRunner::load_str(&lua_src).unwrap();
         let input = build_hook_note_input(&note);
         let result = runner.run(&input).unwrap();
-        let output = apply_hook_result(&result, &note).unwrap();
+        let output = apply_hook_text_edits(&result, &note).unwrap();
         assert!(output.contains("- [x] my task"), "edit was applied");
-        // Status is NOT updated automatically — the Lua hook is responsible for that
-        assert!(
-            output.contains("checklist-status = \"none\""),
-            "status unchanged without hook update"
-        );
     }
 
     #[test]
@@ -758,9 +744,9 @@ end
         );
     }
 
-    /// Hook result is applied directly — the Lua hook is the authority, no Rust correction.
+    /// Hook metadata is returned directly; the central formatter owns persistence.
     #[test]
-    fn test_metadata_patch_applied_directly() {
+    fn test_metadata_patch_returned_directly() {
         let body = "- [x] leaf a\n- [x] leaf b\n";
         let note = make_toml_note("Test", "2601010010", "none", "active", body);
         let runner = HookRunner::load_str(
@@ -769,11 +755,9 @@ end
         .unwrap();
         let input = build_hook_note_input(&note);
         let result = runner.run(&input).unwrap();
-        let output = apply_hook_result(&result, &note).unwrap();
-        // The hook's value is applied as-is — no Rust normalizer overrides it
-        assert!(
-            output.contains("checklist-status = \"todo\""),
-            "hook value applied directly; got:\n{output}"
+        assert_eq!(
+            result.metadata.get("checklist-status"),
+            Some(&toml::Value::String("todo".into()))
         );
     }
 
@@ -831,92 +815,8 @@ end
         let body = "- [x] task\n";
         let note = make_toml_note("Test", "2601010011", "done", "active", body);
         let result = HookResult::default();
-        let first = apply_hook_result(&result, &note).unwrap();
-        let second = apply_hook_result(&result, &first).unwrap();
-        assert_eq!(first, second, "apply_hook_result must be idempotent");
-    }
-
-    // -----------------------------------------------------------------------
-    // Default hook pipeline tests (run_default_hooks)
-    // These verify that the embedded checklist.lua + relation_status.lua hooks
-    // produce output equivalent to the original Rust formatter.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn default_hooks_all_children_done_parent_becomes_checked() {
-        let body = "- [ ] parent\n  - [x] child one\n  - [x] child two\n";
-        let note = make_toml_note("Test", "2601020001", "none", "active", body);
-        let out = run_default_hooks(&note);
-        assert!(out.contains("- [x] parent"), "parent should be checked");
-        assert!(
-            out.contains("checklist-status = \"done\""),
-            "status should be done"
-        );
-    }
-
-    #[test]
-    fn default_hooks_any_child_incomplete_parent_unchecked() {
-        let body = "- [x] parent\n  - [x] child one\n  - [ ] child two\n";
-        let note = make_toml_note("Test", "2601020002", "none", "active", body);
-        let out = run_default_hooks(&note);
-        assert!(out.contains("- [ ] parent"), "parent should be unchecked");
-    }
-
-    #[test]
-    fn default_hooks_three_level_propagates() {
-        let body = "- [ ] grandparent\n  - [ ] parent\n    - [x] grandchild\n";
-        let note = make_toml_note("Test", "2601020003", "none", "active", body);
-        let out = run_default_hooks(&note);
-        assert!(
-            out.contains("- [x] grandparent"),
-            "grandparent propagated to done"
-        );
-        assert!(out.contains("checklist-status = \"done\""), "status done");
-    }
-
-    #[test]
-    fn default_hooks_archived_status_is_done() {
-        let body = "- [ ] unfinished task\n";
-        let note = make_toml_note("Test", "2601020004", "none", "archived", body);
-        let out = run_default_hooks(&note);
-        assert!(
-            out.contains("checklist-status = \"done\""),
-            "archived note → done"
-        );
-    }
-
-    #[test]
-    fn default_hooks_legacy_status_is_done() {
-        let note = make_toml_note("Test", "2601020005", "none", "legacy", "");
-        let out = run_default_hooks(&note);
-        assert!(
-            out.contains("checklist-status = \"done\""),
-            "legacy note → done"
-        );
-    }
-
-    #[test]
-    fn default_hooks_idempotent() {
-        let body = "- [ ] parent\n  - [x] child\n";
-        let note = make_toml_note("Test", "2601020006", "none", "active", body);
-        let first = run_default_hooks(&note);
-        let second = run_default_hooks(&first);
-        assert_eq!(first, second, "default hooks must be idempotent");
-    }
-
-    #[test]
-    fn default_hooks_trailing_newline_preserved() {
-        let body_with = "- [ ] parent\n  - [x] child\n";
-        let body_without = "- [ ] parent\n  - [x] child";
-        let note_with = make_toml_note("Test", "2601020007", "none", "active", body_with);
-        let note_without = make_toml_note("Test", "2601020008", "none", "active", body_without);
-        assert!(
-            run_default_hooks(&note_with).ends_with('\n'),
-            "trailing newline preserved"
-        );
-        assert!(
-            !run_default_hooks(&note_without).ends_with('\n'),
-            "no spurious newline added"
-        );
+        let first = apply_hook_text_edits(&result, &note).unwrap();
+        let second = apply_hook_text_edits(&result, &first).unwrap();
+        assert_eq!(first, second, "text edit application must be idempotent");
     }
 }

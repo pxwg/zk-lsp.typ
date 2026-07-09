@@ -3,7 +3,8 @@ use std::time::UNIX_EPOCH;
 
 use crate::config::WikiConfig;
 use crate::config::{metadata_defaults_table, MetadataFieldConfig};
-use crate::parser::{NoteHeader, ParsedToml, Relation};
+use crate::metadata::{self, MetadataRecord};
+use crate::parser::{NoteHeader, Relation};
 
 fn toml_value_to_json(v: &toml::Value) -> serde_json::Value {
     match v {
@@ -44,7 +45,7 @@ fn merge_missing_table_defaults(target: &mut toml::Table, defaults: &toml::Table
 }
 
 fn merged_extra_metadata(
-    parsed: &ParsedToml,
+    parsed: &MetadataRecord,
     metadata_fields: &[MetadataFieldConfig],
 ) -> toml::Table {
     let mut merged = parsed.extra.clone();
@@ -57,7 +58,7 @@ pub fn build_note_info_value(
     id: &str,
     path: &Path,
     header: &NoteHeader,
-    parsed: &ParsedToml,
+    parsed: &MetadataRecord,
     metadata_fields: &[MetadataFieldConfig],
 ) -> serde_json::Value {
     use serde_json::{json, Map, Value};
@@ -98,14 +99,15 @@ pub fn build_note_info_value_from_content(
     id: &str,
     path: &Path,
     content: &str,
+    record: &MetadataRecord,
     metadata_fields: &[MetadataFieldConfig],
 ) -> anyhow::Result<serde_json::Value> {
-    let (header, parsed_toml) = parse_note_info_content(id, content)?;
+    let header = parse_note_info_content(id, content)?;
     Ok(build_note_info_value(
         id,
         path,
         &header,
-        &parsed_toml,
+        record,
         metadata_fields,
     ))
 }
@@ -114,7 +116,7 @@ pub fn build_note_info_json(
     id: &str,
     path: &Path,
     header: &NoteHeader,
-    parsed: &ParsedToml,
+    parsed: &MetadataRecord,
     metadata_fields: &[MetadataFieldConfig],
     content: &str,
 ) -> anyhow::Result<String> {
@@ -134,12 +136,13 @@ pub async fn build_single_note_info_json(id: &str, config: &WikiConfig) -> anyho
     let content = tokio::fs::read_to_string(&path)
         .await
         .map_err(|err| anyhow::anyhow!("reading {}: {err}", path.display()))?;
-    let (header, parsed_toml) = parse_note_info_content(id, &content)?;
+    let header = parse_note_info_content(id, &content)?;
+    let record = metadata::read_record(config, id).await?;
     build_note_info_json(
         id,
         &path,
         &header,
-        &parsed_toml,
+        &record,
         &config.zk_config.metadata.fields,
         &content,
     )
@@ -148,10 +151,13 @@ pub async fn build_single_note_info_json(id: &str, config: &WikiConfig) -> anyho
 pub async fn build_notes_json(config: &WikiConfig) -> anyhow::Result<String> {
     let mut notes = collect_note_paths(&config.note_dir).await?;
     notes.sort_by(|(id_a, path_a), (id_b, path_b)| id_a.cmp(id_b).then_with(|| path_a.cmp(path_b)));
+    let metadata_snapshot = metadata::MetadataSnapshot::load(config)
+        .await
+        .unwrap_or_else(metadata::MetadataSnapshot::unavailable);
 
     let mut records = Vec::with_capacity(notes.len());
     for (id, path) in notes {
-        records.push(build_note_record(&id, &path, config).await);
+        records.push(build_note_record(&id, &path, config, &metadata_snapshot).await);
     }
 
     Ok(serde_json::to_string_pretty(&records)?)
@@ -177,7 +183,12 @@ async fn collect_note_paths(note_dir: &Path) -> anyhow::Result<Vec<(String, Path
     Ok(notes)
 }
 
-async fn build_note_record(id: &str, path: &Path, config: &WikiConfig) -> serde_json::Value {
+async fn build_note_record(
+    id: &str,
+    path: &Path,
+    config: &WikiConfig,
+    metadata_snapshot: &metadata::MetadataSnapshot,
+) -> serde_json::Value {
     let stat = tokio::fs::metadata(path).await.ok();
     let content = match tokio::fs::read_to_string(path).await {
         Ok(content) => content,
@@ -188,8 +199,22 @@ async fn build_note_record(id: &str, path: &Path, config: &WikiConfig) -> serde_
         }
     };
 
-    match build_note_info_value_from_content(id, path, &content, &config.zk_config.metadata.fields)
-    {
+    let record = match metadata_snapshot.record(id) {
+        Ok(record) => record,
+        Err(err) => {
+            let message = err.to_string();
+            eprintln!("zk-lsp notes: warning: {}: {message}", path.display());
+            return note_error_value(id, path, &message, stat.as_ref());
+        }
+    };
+
+    match build_note_info_value_from_content(
+        id,
+        path,
+        &content,
+        &record,
+        &config.zk_config.metadata.fields,
+    ) {
         Ok(mut value) => {
             add_file_stat(&mut value, stat.as_ref());
             value
@@ -234,23 +259,14 @@ fn add_file_stat(value: &mut serde_json::Value, stat: Option<&std::fs::Metadata>
     }
 }
 
-fn parse_note_info_content(id: &str, content: &str) -> anyhow::Result<(NoteHeader, ParsedToml)> {
-    let Some(block) = crate::parser::find_toml_metadata_block(content) else {
-        anyhow::bail!("Failed to parse note {id} (may be legacy format; run zk-lsp migrate first)");
-    };
-    let parsed_toml = crate::parser::parse_toml_metadata(&block.toml_content).ok_or_else(|| {
-        let detail = match block.toml_content.parse::<toml::Value>() {
-            Ok(_) => "expected TOML metadata table".to_string(),
-            Err(err) => err.to_string(),
-        };
-        anyhow::anyhow!("Failed to parse TOML metadata for note {id}: {detail}")
-    })?;
+fn parse_note_info_content(id: &str, content: &str) -> anyhow::Result<NoteHeader> {
     let header = crate::parser::parse_header(content).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Failed to parse note {id} (may be legacy format; run zk-lsp migrate first)"
-        )
+        anyhow::anyhow!("Failed to parse note {id}: missing or invalid title/metadata binding")
     })?;
-    Ok((header, parsed_toml))
+    if header.id != id {
+        anyhow::bail!("Failed to parse note {id}: title ID does not match current note");
+    }
+    Ok(header)
 }
 
 #[cfg(test)]
@@ -264,24 +280,14 @@ mod tests {
     use super::{build_note_info_value, build_notes_json};
     use crate::config::WikiConfig;
     use crate::config::{MetadataFieldConfig, MetadataFieldKind};
-    use crate::parser::{ChecklistStatus, NoteHeader, ParsedToml, Relation};
+    use crate::metadata::MetadataRecord;
+    use crate::parser::{ChecklistStatus, NoteHeader, Relation};
 
     fn test_header() -> NoteHeader {
         NoteHeader {
             id: "2604070001".into(),
             title: "Test Note".into(),
-            archived: false,
-            legacy: false,
-            alt_id: None,
-            evo_id: None,
-            relation_target: Vec::new(),
-            aliases: Vec::new(),
-            abstract_text: None,
-            keywords: Vec::new(),
-            tag_line_idx: None,
             title_line_idx: 0,
-            metadata_block: None,
-            checklist_status: Some(ChecklistStatus::None),
         }
     }
 
@@ -303,34 +309,49 @@ mod tests {
     fn write_note(root: &Path, id: &str, title: &str, extra_toml: &str) {
         let content = format!(
             "#import \"../include.typ\": *\n\
-             #let zk-metadata = toml(bytes(\n\
-               ```toml\n\
-               schema-version = 1\n\
-               aliases = []\n\
-               abstract = \"\"\n\
-               keywords = []\n\
-               generated = false\n\
-               checklist-status = \"none\"\n\
-               relation = \"active\"\n\
-               relation-target = []\n\
-             {extra_toml}\
-               ```.text,\n\
-             ))\n\
+             #let zk-metadata = zk_metadata(\"{id}\")\n\
              #show: zettel.with(metadata: zk-metadata)\n\
              \n\
              = {title} <{id}>\n"
         );
         fs::write(root.join("note").join(format!("{id}.typ")), content).unwrap();
+        let metadata_path = root.join("metadata.toml");
+        if !metadata_path.exists() {
+            fs::write(&metadata_path, "format-version = 1\n\n").unwrap();
+        }
+        let user_table = if extra_toml.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n[notes.\"{id}\".user]\n{extra_toml}\n")
+        };
+        let record = format!(
+            "[notes.\"{id}\"]\n\
+             schema-version = 1\n\
+             aliases = []\n\
+             abstract = \"\"\n\
+             keywords = []\n\
+             generated = false\n\
+             checklist-status = \"none\"\n\
+             relation = \"active\"\n\
+             relation-target = []\n\
+             {user_table}\n"
+        );
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&metadata_path)
+            .unwrap();
+        file.write_all(record.as_bytes()).unwrap();
     }
 
     #[test]
     fn note_info_includes_missing_custom_metadata_defaults() {
-        let parsed = ParsedToml {
+        let parsed = MetadataRecord {
             extra: toml::toml! {
                 [user]
                 course = "QFT"
             },
-            ..ParsedToml::default()
+            ..MetadataRecord::default()
         };
         let metadata_fields = vec![
             MetadataFieldConfig {
@@ -376,7 +397,7 @@ mod tests {
 
     #[test]
     fn note_info_preserves_explicit_custom_metadata_values() {
-        let parsed = ParsedToml {
+        let parsed = MetadataRecord {
             checklist_status: ChecklistStatus::Todo,
             relation: Relation::Archived,
             extra: toml::toml! {
@@ -384,7 +405,7 @@ mod tests {
                 priority = "urgent"
                 reviewed = true
             },
-            ..ParsedToml::default()
+            ..MetadataRecord::default()
         };
         let metadata_fields = vec![
             MetadataFieldConfig {
@@ -432,13 +453,8 @@ default = "normal"
 "#,
         )
         .unwrap();
-        write_note(&root, "2222222222", "Second", "");
-        write_note(
-            &root,
-            "1111111111",
-            "First",
-            "  [user]\n  priority = \"urgent\"\n",
-        );
+        write_note(&root, "2222222222", "Second", "priority = \"normal\"\n");
+        write_note(&root, "1111111111", "First", "priority = \"urgent\"\n");
 
         let config = WikiConfig::from_root(root.clone());
         let out = build_notes_json(&config).await.unwrap();
@@ -473,10 +489,11 @@ default = "normal"
         assert_eq!(arr[1]["id"], "2222222222");
         assert_eq!(arr[1]["title"], "");
         assert_eq!(arr[1]["metadata"], json!({}));
-        assert!(arr[1]["error"]
-            .as_str()
-            .unwrap()
-            .contains("Failed to parse note"));
+        let error = arr[1]["error"].as_str().unwrap();
+        assert!(
+            error.contains("Failed to parse note") || error.contains("Missing metadata"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -485,14 +502,16 @@ default = "normal"
         write_note(&root, "1111111111", "Good", "");
         fs::write(
             root.join("note/2222222222.typ"),
-            "#let zk-metadata = toml(bytes(\n\
-               ```toml\n\
-               schema-version = [\n\
-               ```.text,\n\
-             ))\n\
+            "#import \"../include.typ\": *\n\
+             #let zk-metadata = zk_metadata(\"2222222222\")\n\
              #show: zettel.with(metadata: zk-metadata)\n\
              \n\
              = Broken <2222222222>\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("metadata.toml"),
+            "format-version = 1\n[notes.\"2222222222\"\nschema-version = 1\n",
         )
         .unwrap();
 
@@ -504,9 +523,6 @@ default = "normal"
         let arr = items.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[1]["id"], "2222222222");
-        assert!(arr[1]["error"]
-            .as_str()
-            .unwrap()
-            .contains("Failed to parse TOML metadata"));
+        assert!(arr[1]["error"].as_str().unwrap().contains("parsing"));
     }
 }

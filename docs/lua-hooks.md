@@ -299,7 +299,7 @@ Useful for an AI agent that wants to skip summarising short notes.
 function run(note)
   local count = 0
   for _ in note.content:gmatch("%S+") do count = count + 1 end
-  return { metadata = { ["user"] = { ["word-count"] = count } } }
+  return { metadata = { ["user.word-count"] = count } }
 end
 ```
 
@@ -308,9 +308,9 @@ decide whether the note needs further processing.
 
 ### 5 — Backfill missing metadata keys from config defaults
 
-Useful when `[[metadata.field]]` adds a new key and older notes have not been
-updated yet. On save, the hook emits only missing keys; `zk-lsp` handles the
-actual TOML patching and insertion into the metadata block.
+Useful when `[[metadata.field]]` adds a new key and older records have not been
+updated yet. On save, the hook emits only missing keys; `zk-lsp` writes those
+flat field paths into the current note's central metadata record.
 
 ```lua
 -- hooks/ensure_metadata_defaults.lua

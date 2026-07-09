@@ -10,8 +10,8 @@ mod hooks;
 mod index;
 mod init;
 mod link_gen;
+mod metadata;
 mod metadata_schema;
-mod migrate;
 mod note_info;
 mod note_ops;
 mod parser;
@@ -90,16 +90,8 @@ async fn main() -> anyhow::Result<()> {
             use std::io::Read;
             let mut content = String::new();
             std::io::stdin().read_to_string(&mut content)?;
-            let formatted = handlers::formatting::format_content(&content, &config).await;
+            let formatted = handlers::formatting::format_content(&content, &config).await?;
             print!("{formatted}");
-        }
-        Command::Migrate => {
-            eprintln!("Migrating legacy notes in {} …", config.note_dir.display());
-            let stats = migrate::migrate_wiki(&config).await?;
-            eprintln!(
-                "Done: {} migrated, {} already current, {} skipped.",
-                stats.migrated, stats.already_current, stats.skipped
-            );
         }
         Command::Reconcile { dry_run } => match reconcile::run_reconcile(&config, dry_run).await {
             Ok(stats) => eprintln!("Reconcile: {} file(s) changed", stats.files_changed),

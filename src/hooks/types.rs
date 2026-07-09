@@ -78,8 +78,8 @@ pub struct HookHeading {
 
 /// Full note representation passed to every Lua hook's `run(note)` function.
 ///
-/// The `metadata` table mirrors the TOML block verbatim, including any
-/// `[user]` sub-table for custom fields declared in the project config.
+/// The `metadata` table mirrors the current note's central metadata record,
+/// including any `user` sub-table for custom fields declared in the project config.
 ///
 /// See the [Lua Hooks guide](https://docs.rs/zk-lsp/latest/zk_lsp/lua_hooks/)
 /// for field-by-field documentation and example hook implementations.
@@ -91,7 +91,7 @@ pub struct HookNoteInput {
     pub title: Option<HookTitle>,
     /// Full raw note content as a UTF-8 string.
     pub content: String,
-    /// Parsed TOML metadata block (key → value).
+    /// Central metadata record (key → value).
     pub metadata: toml::Table,
     /// Default values for config-declared metadata fields.
     ///

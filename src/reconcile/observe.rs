@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::config::{MetadataFieldConfig, MetadataFieldKind};
+use crate::metadata::MetadataRecord;
 use crate::parser::{self, ChecklistItemKind, ChecklistStatus, Relation};
 
 use super::types::{CheckboxId, NoteId, Status, Value};
@@ -137,6 +138,14 @@ impl WorkspaceSnapshot {
         notes: &HashMap<NoteId, (PathBuf, String)>,
         metadata_fields: &[MetadataFieldConfig],
     ) -> Self {
+        Self::from_note_map_with_metadata_records(notes, &HashMap::new(), metadata_fields)
+    }
+
+    pub fn from_note_map_with_metadata_records(
+        notes: &HashMap<NoteId, (PathBuf, String)>,
+        metadata_records: &HashMap<NoteId, MetadataRecord>,
+        metadata_fields: &[MetadataFieldConfig],
+    ) -> Self {
         let mut note_obs_map: HashMap<NoteId, NoteObs> = HashMap::new();
         let mut checkboxes: HashMap<CheckboxId, CheckboxObs> = HashMap::new();
         let mut note_checkboxes: HashMap<NoteId, Vec<CheckboxId>> = HashMap::new();
@@ -146,24 +155,13 @@ impl WorkspaceSnapshot {
         let metadata_defaults = metadata_default_map(metadata_fields);
 
         for (id, (_path, content)) in notes {
-            // Parse header for relation + checklist_status
-            let (relation, checklist_status) = if let Some(header) = parser::parse_header(content) {
-                let relation = if header.archived {
-                    Relation::Archived
-                } else {
-                    // Parse full TOML to get relation
-                    parser::find_toml_metadata_block(content)
-                        .and_then(|b| parser::parse_toml_metadata(&b.toml_content))
-                        .map(|m| m.relation)
-                        .unwrap_or(Relation::Active)
-                };
-                let status = header.checklist_status.unwrap_or(ChecklistStatus::None);
-                (relation, status)
+            let (relation, raw_meta) = if let Some(record) = metadata_records.get(id) {
+                let relation = record.relation.clone();
+                let raw_meta = extract_raw_meta_from_record(record, &metadata_kinds);
+                (relation, raw_meta)
             } else {
-                (Relation::Active, ChecklistStatus::None)
+                (Relation::Active, HashMap::new())
             };
-
-            let raw_meta = extract_raw_meta(content, &metadata_kinds, checklist_status, &relation);
 
             note_obs_map.insert(id.clone(), NoteObs { relation, raw_meta });
 
@@ -269,41 +267,79 @@ fn metadata_default_map(metadata_fields: &[MetadataFieldConfig]) -> HashMap<Stri
     defaults
 }
 
-fn extract_raw_meta(
-    content: &str,
+fn extract_raw_meta_from_record(
+    record: &MetadataRecord,
     metadata_kinds: &HashMap<String, MetadataFieldKind>,
-    checklist_status: ChecklistStatus,
-    relation: &Relation,
 ) -> HashMap<String, Value> {
+    let mut table = record.extra.clone();
+    table.insert(
+        "schema-version".into(),
+        toml::Value::Integer(record.schema_version as i64),
+    );
+    table.insert(
+        "aliases".into(),
+        toml::Value::Array(
+            record
+                .aliases
+                .iter()
+                .cloned()
+                .map(toml::Value::String)
+                .collect(),
+        ),
+    );
+    table.insert(
+        "abstract".into(),
+        toml::Value::String(record.abstract_text.clone().unwrap_or_default()),
+    );
+    table.insert(
+        "keywords".into(),
+        toml::Value::Array(
+            record
+                .keywords
+                .iter()
+                .cloned()
+                .map(toml::Value::String)
+                .collect(),
+        ),
+    );
+    table.insert("generated".into(), toml::Value::Boolean(record.generated));
+    table.insert(
+        "checklist-status".into(),
+        toml::Value::String(record.checklist_status.as_str().into()),
+    );
+    table.insert(
+        "relation".into(),
+        toml::Value::String(
+            match record.relation {
+                Relation::Archived => "archived",
+                Relation::Legacy => "legacy",
+                Relation::Active => "active",
+            }
+            .into(),
+        ),
+    );
+    table.insert(
+        "relation-target".into(),
+        toml::Value::Array(
+            record
+                .relation_target
+                .iter()
+                .cloned()
+                .map(toml::Value::String)
+                .collect(),
+        ),
+    );
+
     let mut raw_meta = HashMap::new();
-
-    let Some(block) = parser::find_toml_metadata_block(content) else {
-        return raw_meta;
-    };
-    let Ok(value) = block.toml_content.parse::<toml::Value>() else {
-        return raw_meta;
-    };
-    let Some(table) = value.as_table() else {
-        return raw_meta;
-    };
-
-    flatten_toml_table("", table, metadata_kinds, &mut raw_meta);
+    flatten_toml_table("", &table, metadata_kinds, &mut raw_meta);
     raw_meta.insert(
         "checklist-status".to_string(),
-        Value::Status(match checklist_status {
+        Value::Status(match record.checklist_status {
             ChecklistStatus::Done => Status::Done,
             ChecklistStatus::Wip => Status::Wip,
             ChecklistStatus::Todo => Status::Todo,
             ChecklistStatus::None => Status::None,
         }),
-    );
-    raw_meta.insert(
-        "relation".to_string(),
-        Value::String(Rc::from(match relation {
-            Relation::Archived => "archived",
-            Relation::Active => "active",
-            Relation::Legacy => "legacy",
-        })),
     );
     raw_meta
 }
@@ -419,17 +455,10 @@ mod tests {
     use crate::config::{MetadataFieldConfig, MetadataFieldKind};
 
     fn make_toml_note(title: &str, id: &str, status: &str, body: &str) -> String {
+        let _ = status;
         format!(
             "#import \"../include.typ\": *\n\
-             #let zk-metadata = toml(bytes(\n\
-             \x20 ```toml\n\
-             \x20 schema-version = 1\n\
-             \x20 title = \"{title}\"\n\
-             \x20 tags = []\n\
-             \x20 checklist-status = \"{status}\"\n\
-             \x20 generated = false\n\
-             \x20 ```.text,\n\
-             ))\n\
+             #let zk-metadata = zk_metadata(\"{id}\")\n\
              #show: zettel.with(metadata: zk-metadata)\n\
              \n\
              = {title} <{id}>\n\
@@ -444,19 +473,10 @@ mod tests {
         relation: &str,
         body: &str,
     ) -> String {
+        let _ = (status, relation);
         format!(
             "#import \"../include.typ\": *\n\
-             #let zk-metadata = toml(bytes(\n\
-             \x20 ```toml\n\
-             \x20 schema-version = 1\n\
-             \x20 title = \"{title}\"\n\
-             \x20 tags = []\n\
-             \x20 checklist-status = \"{status}\"\n\
-             \x20 relation = \"{relation}\"\n\
-             \x20 relation-target = []\n\
-             \x20 generated = false\n\
-             \x20 ```.text,\n\
-             ))\n\
+             #let zk-metadata = zk_metadata(\"{id}\")\n\
              #show: zettel.with(metadata: zk-metadata)\n\
              \n\
              = {title} <{id}>\n\
@@ -471,18 +491,10 @@ mod tests {
         extra_metadata: &str,
         body: &str,
     ) -> String {
+        let _ = (status, extra_metadata);
         format!(
             "#import \"../include.typ\": *\n\
-             #let zk-metadata = toml(bytes(\n\
-             \x20 ```toml\n\
-             \x20 schema-version = 1\n\
-             \x20 title = \"{title}\"\n\
-             \x20 tags = []\n\
-             \x20 checklist-status = \"{status}\"\n\
-             \x20 generated = false\n\
-             {extra_metadata}\
-             \x20 ```.text,\n\
-             ))\n\
+             #let zk-metadata = zk_metadata(\"{id}\")\n\
              #show: zettel.with(metadata: zk-metadata)\n\
              \n\
              = {title} <{id}>\n\
@@ -499,9 +511,10 @@ mod tests {
         WorkspaceSnapshot::from_note_map(&map)
     }
 
-    fn single_note_snapshot_with_metadata(
+    fn single_note_snapshot_with_record(
         id: &str,
         content: &str,
+        record: MetadataRecord,
         metadata_fields: &[MetadataFieldConfig],
     ) -> WorkspaceSnapshot {
         let mut map = HashMap::new();
@@ -509,7 +522,26 @@ mod tests {
             id.to_string(),
             (PathBuf::from(format!("{id}.typ")), content.to_string()),
         );
-        WorkspaceSnapshot::from_note_map_with_metadata(&map, metadata_fields)
+        let metadata_records = HashMap::from([(id.to_string(), record)]);
+        WorkspaceSnapshot::from_note_map_with_metadata_records(
+            &map,
+            &metadata_records,
+            metadata_fields,
+        )
+    }
+
+    fn record(status: Status, relation: Relation, extra: toml::Table) -> MetadataRecord {
+        MetadataRecord {
+            checklist_status: match status {
+                Status::Done => ChecklistStatus::Done,
+                Status::Wip => ChecklistStatus::Wip,
+                Status::Todo => ChecklistStatus::Todo,
+                Status::None => ChecklistStatus::None,
+            },
+            relation,
+            extra,
+            ..MetadataRecord::default()
+        }
     }
 
     #[test]
@@ -583,7 +615,12 @@ mod tests {
     #[test]
     fn archived_note_relation() {
         let content = make_toml_note_with_relation("A", "1111111111", "none", "archived", "");
-        let snap = single_note_snapshot("1111111111", &content);
+        let snap = single_note_snapshot_with_record(
+            "1111111111",
+            &content,
+            record(Status::None, Relation::Archived, toml::Table::new()),
+            &[],
+        );
         let obs = snap
             .note_obs(&"1111111111".to_string())
             .expect("note exists");
@@ -593,7 +630,12 @@ mod tests {
     #[test]
     fn meta_status_fallback() {
         let content = make_toml_note("A", "1111111111", "done", "");
-        let snap = single_note_snapshot("1111111111", &content);
+        let snap = single_note_snapshot_with_record(
+            "1111111111",
+            &content,
+            record(Status::Done, Relation::Active, toml::Table::new()),
+            &[],
+        );
         let status = snap.observe_meta(&"1111111111".to_string(), "checklist-status");
         assert_eq!(status, Value::Status(Status::Done));
     }
@@ -655,14 +697,24 @@ mod tests {
                 default: toml::Value::Array(Vec::new()),
             },
         ];
-        let content = make_toml_note_with_extra_metadata(
-            "A",
-            "1111111111",
-            "none",
-            "             user.kind = \"project\"\n             user.priority = true\n             user.tags = [\"alpha\", \"beta\"]\n",
-            "",
+        let content = make_toml_note_with_extra_metadata("A", "1111111111", "none", "", "");
+        let mut user = toml::Table::new();
+        user.insert("kind".into(), toml::Value::String("project".into()));
+        user.insert("priority".into(), toml::Value::Boolean(true));
+        user.insert(
+            "tags".into(),
+            toml::Value::Array(vec![
+                toml::Value::String("alpha".into()),
+                toml::Value::String("beta".into()),
+            ]),
         );
-        let snap = single_note_snapshot_with_metadata("1111111111", &content, &metadata_fields);
+        let extra = toml::Table::from_iter([("user".into(), toml::Value::Table(user))]);
+        let snap = single_note_snapshot_with_record(
+            "1111111111",
+            &content,
+            record(Status::None, Relation::Active, extra),
+            &metadata_fields,
+        );
 
         assert_eq!(
             snap.observe_meta(&"1111111111".to_string(), "user.kind"),

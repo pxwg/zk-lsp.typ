@@ -3,21 +3,37 @@ use std::sync::Arc;
 use tower_lsp::lsp_types::*;
 
 use crate::index::NoteIndex;
-use crate::parser;
+use crate::{metadata, parser};
 
-/// Jump from a quoted note ID inside `relation-target = [...]` to the target
-/// note's title line.
-pub fn get_definition(
+pub fn get_note_definition(
+    content: &str,
+    position: Position,
+    metadata_uri: &Url,
+    metadata_content: &str,
+) -> Option<Location> {
+    let header = parser::parse_header(content)?;
+    let id = note_id_at_position(content, position)?;
+    if id != header.id {
+        return None;
+    }
+    let range = metadata::find_record_key_range(metadata_content, &id)?;
+    Some(Location {
+        uri: metadata_uri.clone(),
+        range: lsp_range(range),
+    })
+}
+
+pub fn get_metadata_definition(
     content: &str,
     position: Position,
     index: &Arc<NoteIndex>,
 ) -> Option<Location> {
-    get_definition_with_loader(content, position, index, |path| {
+    get_metadata_definition_with_loader(content, position, index, |path| {
         std::fs::read_to_string(path).ok()
     })
 }
 
-fn get_definition_with_loader<F>(
+fn get_metadata_definition_with_loader<F>(
     content: &str,
     position: Position,
     index: &Arc<NoteIndex>,
@@ -26,21 +42,10 @@ fn get_definition_with_loader<F>(
 where
     F: Fn(&std::path::Path) -> Option<String>,
 {
-    let block = parser::find_toml_metadata_block(content)?;
-    let line_num = position.line as usize;
-    if line_num < block.start_line || line_num > block.end_line {
-        return None;
-    }
-
-    let lines: Vec<&str> = content.lines().collect();
-    let current_line = lines.get(line_num).copied()?;
-    let trimmed = current_line.trim_start();
-    if !trimmed.starts_with("relation-target") || !trimmed.contains('[') {
-        return None;
-    }
-
-    let id = find_id_at_col(current_line, position.character as usize)?;
-    let info = index.notes.get(&id)?;
+    let id_pos =
+        metadata::id_at_position(content, position.line as usize, position.character as usize)?;
+    let target_id = id_pos.target_id;
+    let info = index.notes.get(&target_id)?;
     let note_content = load_note(&info.path)?;
     let title_line = parser::parse_header(&note_content)?.title_line_idx as u32;
 
@@ -59,26 +64,47 @@ where
     })
 }
 
+fn note_id_at_position(content: &str, position: Position) -> Option<String> {
+    let line = content.lines().nth(position.line as usize)?;
+    find_id_at_col(line, position.character as usize)
+}
+
 fn find_id_at_col(line: &str, col: usize) -> Option<String> {
     let bytes = line.as_bytes();
     let len = bytes.len();
     let mut i = 0;
     while i < len {
-        if bytes[i] == b'"' {
-            let start = i + 1;
-            let end = (start + 10).min(len);
-            if end < len && bytes[end] == b'"' {
-                let candidate = &line[start..end];
-                if candidate.len() == 10 && candidate.bytes().all(|b| b.is_ascii_digit()) {
-                    if col >= i && col <= end {
-                        return Some(candidate.to_string());
-                    }
-                }
-            }
+        let start = if bytes[i] == b'<' || bytes[i] == b'"' {
+            i + 1
+        } else {
+            i += 1;
+            continue;
+        };
+        let end = start + 10;
+        if end < len
+            && (bytes[end] == b'>' || bytes[end] == b'"')
+            && bytes[start..end].iter().all(|b| b.is_ascii_digit())
+            && col >= i
+            && col <= end
+        {
+            return Some(line[start..end].to_string());
         }
         i += 1;
     }
     None
+}
+
+fn lsp_range(range: metadata::MetadataTextRange) -> Range {
+    Range {
+        start: Position {
+            line: range.line as u32,
+            character: range.start_col as u32,
+        },
+        end: Position {
+            line: range.line as u32,
+            character: range.end_col as u32,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -112,29 +138,27 @@ mod tests {
         Arc::new(idx)
     }
 
-    const HOST_NOTE_CONTENT: &str = concat!(
+    const NOTE_CONTENT: &str = concat!(
         "#import \"../include.typ\": *\n",
-        "#let zk-metadata = toml(bytes(\n",
-        "  ```toml\n",
-        "  schema-version = 1\n",
-        "  relation = \"archived\"\n",
-        "  relation-target = [\"2603110001\"]\n",
-        "  ```.text,\n",
-        "))\n",
+        "#let zk-metadata = zk_metadata(\"2603110000\")\n",
         "#show: zettel.with(metadata: zk-metadata)\n",
         "\n",
         "= Host <2603110000>\n",
     );
 
+    const METADATA_CONTENT: &str = concat!(
+        "format-version = 1\n\n",
+        "[notes.\"2603110000\"]\n",
+        "schema-version = 1\n",
+        "relation-target = [\"2603110001\"]\n\n",
+        "[notes.\"2603110001\"]\n",
+        "schema-version = 1\n",
+        "relation-target = []\n",
+    );
+
     const TARGET_NOTE_CONTENT: &str = concat!(
         "#import \"../include.typ\": *\n",
-        "#let zk-metadata = toml(bytes(\n",
-        "  ```toml\n",
-        "  schema-version = 1\n",
-        "  relation = \"active\"\n",
-        "  relation-target = []\n",
-        "  ```.text,\n",
-        "))\n",
+        "#let zk-metadata = zk_metadata(\"2603110001\")\n",
         "#show: zettel.with(metadata: zk-metadata)\n",
         "\n",
         "= Target <2603110001>\n",
@@ -142,35 +166,45 @@ mod tests {
     );
 
     #[test]
-    fn test_definition_on_relation_target_jumps_to_target_title() {
-        let path = PathBuf::from("/virtual/2603110001.typ");
-        let index = make_index("2603110001", "Target Note", path.clone());
-        let pos = Position {
-            line: 5,
-            character: 22,
-        };
-        let loc = get_definition_with_loader(HOST_NOTE_CONTENT, pos, &index, |load_path| {
-            if load_path == path.as_path() {
-                Some(TARGET_NOTE_CONTENT.to_string())
-            } else {
-                None
-            }
-        })
+    fn note_title_id_jumps_to_metadata_record() {
+        let uri = Url::parse("file:///wiki/metadata.toml").unwrap();
+        let loc = get_note_definition(
+            NOTE_CONTENT,
+            Position {
+                line: 4,
+                character: 10,
+            },
+            &uri,
+            METADATA_CONTENT,
+        )
         .expect("expected definition");
-
-        assert_eq!(loc.uri, Url::from_file_path(path).unwrap());
-        assert_eq!(loc.range.start.line, 10);
-        assert_eq!(loc.range.start.character, 0);
-        assert_eq!(loc.range.end, loc.range.start);
+        assert_eq!(loc.uri, uri);
+        assert_eq!(loc.range.start.line, 2);
+        assert_eq!(loc.range.start.character, 8);
     }
 
     #[test]
-    fn test_definition_outside_relation_target_returns_none() {
-        let index = make_index("2603110001", "Target Note", PathBuf::from("/virtual/x.typ"));
-        let pos = Position {
-            line: 5,
-            character: 5,
-        };
-        assert!(get_definition(HOST_NOTE_CONTENT, pos, &index).is_none());
+    fn metadata_relation_target_jumps_to_target_title() {
+        let path = PathBuf::from("/virtual/2603110001.typ");
+        let index = make_index("2603110001", "Target Note", path.clone());
+        let loc = get_metadata_definition_with_loader(
+            METADATA_CONTENT,
+            Position {
+                line: 4,
+                character: 22,
+            },
+            &index,
+            |load_path| {
+                if load_path == path.as_path() {
+                    Some(TARGET_NOTE_CONTENT.to_string())
+                } else {
+                    None
+                }
+            },
+        )
+        .expect("expected definition");
+
+        assert_eq!(loc.uri, Url::from_file_path(path).unwrap());
+        assert_eq!(loc.range.start.line, 4);
     }
 }

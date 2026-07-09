@@ -7,6 +7,7 @@ use tokio::fs;
 use tokio::sync::RwLock;
 
 use crate::config::WikiConfig;
+use crate::metadata;
 use crate::parser::{self, ChecklistStatus};
 
 #[derive(Debug, Clone)]
@@ -56,10 +57,14 @@ impl NoteIndex {
         self.notes.clear();
         self.backlinks.clear();
 
-        let note_dir = {
+        let config = {
             let config = self.config.read().await;
-            config.note_dir.clone()
+            config.clone()
         };
+        let note_dir = config.note_dir.clone();
+        let metadata_snapshot = metadata::MetadataSnapshot::load(&config)
+            .await
+            .unwrap_or_else(metadata::MetadataSnapshot::unavailable);
         let mut entries = fs::read_dir(&note_dir).await?;
         let mut paths = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
@@ -74,7 +79,9 @@ impl NoteIndex {
         }
 
         for path in &paths {
-            let _ = self.index_file(path).await;
+            let _ = self
+                .index_file_with_metadata(path, &metadata_snapshot)
+                .await;
         }
 
         Ok(self.notes.len())
@@ -132,20 +139,55 @@ impl NoteIndex {
     // -----------------------------------------------------------------------
 
     async fn index_file(&self, path: &Path) -> Result<()> {
+        let config = self.config.read().await.clone();
+        let metadata_snapshot = metadata::MetadataSnapshot::load(&config)
+            .await
+            .unwrap_or_else(metadata::MetadataSnapshot::unavailable);
+        self.index_file_with_metadata(path, &metadata_snapshot)
+            .await
+    }
+
+    async fn index_file_with_metadata(
+        &self,
+        path: &Path,
+        metadata_snapshot: &metadata::MetadataSnapshot,
+    ) -> Result<()> {
         let content = fs::read_to_string(path).await?;
-        if let Some(header) = parser::parse_header(&content) {
+        let path_id = path.file_stem().and_then(|stem| stem.to_str());
+        if let Some(header) =
+            parser::parse_header(&content).filter(|header| path_id == Some(header.id.as_str()))
+        {
+            let metadata = metadata_snapshot.record(&header.id).ok();
+            let archived = metadata
+                .as_ref()
+                .map(|m| m.relation == parser::Relation::Archived)
+                .unwrap_or(false);
+            let legacy = metadata
+                .as_ref()
+                .map(|m| m.relation == parser::Relation::Legacy)
+                .unwrap_or(false);
+            let relation_target = metadata
+                .as_ref()
+                .map(|m| m.relation_target.clone())
+                .unwrap_or_default();
             let info = NoteInfo {
                 id: header.id.clone(),
                 title: header.title.clone(),
-                archived: header.archived,
-                legacy: header.legacy,
-                alt_id: header.alt_id.clone(),
-                evo_id: header.evo_id.clone(),
-                relation_target: header.relation_target.clone(),
-                aliases: header.aliases.clone(),
-                keywords: header.keywords.clone(),
-                abstract_text: header.abstract_text.clone(),
-                checklist_status: header.checklist_status.clone(),
+                archived,
+                legacy,
+                alt_id: archived.then(|| relation_target.first().cloned()).flatten(),
+                evo_id: legacy.then(|| relation_target.first().cloned()).flatten(),
+                relation_target,
+                aliases: metadata
+                    .as_ref()
+                    .map(|m| m.aliases.clone())
+                    .unwrap_or_default(),
+                keywords: metadata
+                    .as_ref()
+                    .map(|m| m.keywords.clone())
+                    .unwrap_or_default(),
+                abstract_text: metadata.as_ref().and_then(|m| m.abstract_text.clone()),
+                checklist_status: metadata.as_ref().map(|m| m.checklist_status.clone()),
                 path: path.to_path_buf(),
             };
             self.notes.insert(header.id.clone(), info);
@@ -175,5 +217,41 @@ impl NoteIndex {
         }
         // Remove empty entries
         self.backlinks.retain(|_, v| !v.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::WikiConfig;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn index_file_requires_path_id_to_match_note_header() {
+        let root = std::env::temp_dir().join(format!("zk-lsp-index-{}", std::process::id()));
+        let note_dir = root.join("note");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&note_dir).unwrap();
+        let path = note_dir.join("2603110000.typ");
+        std::fs::write(
+            &path,
+            concat!(
+                "#import \"../include.typ\": *\n",
+                "#let zk-metadata = zk_metadata(\"2603119999\")\n",
+                "#show: zettel.with(metadata: zk-metadata)\n",
+                "\n",
+                "= Wrong <2603119999>\n",
+            ),
+        )
+        .unwrap();
+
+        let config = Arc::new(RwLock::new(WikiConfig::from_root(root.clone())));
+        let index = NoteIndex::new(config);
+        index.update_file(&path).await.unwrap();
+
+        assert!(index.get("2603119999").is_none());
+        assert!(index.get("2603110000").is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -41,8 +41,6 @@ pub enum Command {
     },
     /// Format a note: read from stdin, write formatted content to stdout
     Format,
-    /// Migrate legacy comment-format notes to TOML schema v1
-    Migrate,
     /// Reconcile cross-file checkbox states across the whole wiki
     Reconcile {
         /// Show what would change without writing any files

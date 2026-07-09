@@ -742,6 +742,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::metadata::MetadataRecord;
+    use crate::parser::{ChecklistStatus, Relation};
     use crate::reconcile::default_module::DEFAULT_MODULE;
     use crate::reconcile::observe::WorkspaceSnapshot;
     use crate::reconcile::parser::parse_module;
@@ -751,17 +753,10 @@ mod tests {
     }
 
     fn make_toml_note(title: &str, id: &str, status: &str, body: &str) -> String {
+        let _ = status;
         format!(
             "#import \"../include.typ\": *\n\
-             #let zk-metadata = toml(bytes(\n\
-             \x20 ```toml\n\
-             \x20 schema-version = 1\n\
-             \x20 title = \"{title}\"\n\
-             \x20 tags = []\n\
-             \x20 checklist-status = \"{status}\"\n\
-             \x20 generated = false\n\
-             \x20 ```.text,\n\
-             ))\n\
+             #let zk-metadata = zk_metadata(\"{id}\")\n\
              #show: zettel.with(metadata: zk-metadata)\n\
              \n\
              = {title} <{id}>\n\
@@ -772,17 +767,7 @@ mod tests {
     fn make_archived_note(title: &str, id: &str, body: &str) -> String {
         format!(
             "#import \"../include.typ\": *\n\
-             #let zk-metadata = toml(bytes(\n\
-             \x20 ```toml\n\
-             \x20 schema-version = 1\n\
-             \x20 title = \"{title}\"\n\
-             \x20 tags = []\n\
-             \x20 checklist-status = \"none\"\n\
-             \x20 relation = \"archived\"\n\
-             \x20 relation-target = []\n\
-             \x20 generated = false\n\
-             \x20 ```.text,\n\
-             ))\n\
+             #let zk-metadata = zk_metadata(\"{id}\")\n\
              #show: zettel.with(metadata: zk-metadata)\n\
              \n\
              = {title} <{id}>\n\
@@ -801,6 +786,40 @@ mod tests {
             })
             .collect();
         WorkspaceSnapshot::from_note_map(&map)
+    }
+
+    fn snapshot_from_records(
+        notes: &[(&str, &str)],
+        records: &[(&str, Status, Relation)],
+    ) -> WorkspaceSnapshot {
+        let map: HashMap<NoteId, (PathBuf, String)> = notes
+            .iter()
+            .map(|(id, content)| {
+                (
+                    id.to_string(),
+                    (PathBuf::from(format!("{id}.typ")), content.to_string()),
+                )
+            })
+            .collect();
+        let metadata_records: HashMap<NoteId, MetadataRecord> = records
+            .iter()
+            .map(|(id, status, relation)| {
+                (
+                    id.to_string(),
+                    MetadataRecord {
+                        checklist_status: match status {
+                            Status::Done => ChecklistStatus::Done,
+                            Status::Wip => ChecklistStatus::Wip,
+                            Status::Todo => ChecklistStatus::Todo,
+                            Status::None => ChecklistStatus::None,
+                        },
+                        relation: relation.clone(),
+                        ..MetadataRecord::default()
+                    },
+                )
+            })
+            .collect();
+        WorkspaceSnapshot::from_note_map_with_metadata_records(&map, &metadata_records, &[])
     }
 
     fn checklist_status_field(result: &EvalResult, note_id: &str) -> Option<Status> {
@@ -841,7 +860,10 @@ mod tests {
     fn ref_checkbox_target_done() {
         let note_b = make_toml_note("B", "2222222222", "done", "");
         let note_a = make_toml_note("A", "1111111111", "none", "- [ ] @2222222222\n");
-        let snap = snapshot_from(&[("1111111111", &note_a), ("2222222222", &note_b)]);
+        let snap = snapshot_from_records(
+            &[("1111111111", &note_a), ("2222222222", &note_b)],
+            &[("2222222222", Status::Done, Relation::Active)],
+        );
         let checkbox_id = snap.local_checkboxes(&"1111111111".to_string())[0].clone();
         let module = default_module();
         let result = eval_all(&module, &snap);
@@ -906,7 +928,10 @@ mod tests {
     #[test]
     fn archived_note_always_done() {
         let content = make_archived_note("A", "1111111111", "- [ ] unchecked\n");
-        let snap = snapshot_from(&[("1111111111", &content)]);
+        let snap = snapshot_from_records(
+            &[("1111111111", &content)],
+            &[("1111111111", Status::None, Relation::Archived)],
+        );
         let module = default_module();
         let result = eval_all(&module, &snap);
         assert_eq!(
@@ -997,11 +1022,17 @@ mod tests {
         let note_a = make_toml_note("A", "1111111111", "none", "");
         let note_b = make_toml_note("B", "2222222222", "done", "- [ ] @1111111111\n");
         let note_c = make_toml_note("C", "3333333333", "todo", "- [ ] @1111111111\n");
-        let snap = snapshot_from(&[
-            ("1111111111", &note_a),
-            ("2222222222", &note_b),
-            ("3333333333", &note_c),
-        ]);
+        let snap = snapshot_from_records(
+            &[
+                ("1111111111", &note_a),
+                ("2222222222", &note_b),
+                ("3333333333", &note_c),
+            ],
+            &[
+                ("2222222222", Status::Done, Relation::Active),
+                ("3333333333", Status::Todo, Relation::Active),
+            ],
+        );
         let result = eval_all(&module, &snap);
         assert!(result.diagnostics.is_empty());
         assert_eq!(
@@ -1031,12 +1062,19 @@ mod tests {
         let note_b = make_toml_note("B", "2222222222", "done", "- [ ] @1111111111\n");
         let note_c = make_toml_note("C", "3333333333", "done", "- [ ] @1111111111\n");
         let note_d = make_toml_note("D", "4444444444", "todo", "- [ ] @1111111111\n");
-        let snap = snapshot_from(&[
-            ("1111111111", &note_a),
-            ("2222222222", &note_b),
-            ("3333333333", &note_c),
-            ("4444444444", &note_d),
-        ]);
+        let snap = snapshot_from_records(
+            &[
+                ("1111111111", &note_a),
+                ("2222222222", &note_b),
+                ("3333333333", &note_c),
+                ("4444444444", &note_d),
+            ],
+            &[
+                ("2222222222", Status::Done, Relation::Active),
+                ("3333333333", Status::Done, Relation::Active),
+                ("4444444444", Status::Todo, Relation::Active),
+            ],
+        );
         let result = eval_all(&module, &snap);
         assert!(result.diagnostics.is_empty());
         assert_eq!(

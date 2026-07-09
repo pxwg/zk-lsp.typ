@@ -14,7 +14,7 @@ use crate::handlers::{
 };
 use crate::index::NoteIndex;
 use crate::note_ops::MetaOverrides;
-use crate::{link_gen, note_ops, reconcile, watcher};
+use crate::{link_gen, metadata, note_ops, parser, reconcile, watcher};
 
 pub struct ZkLspServer {
     client: Client,
@@ -49,19 +49,37 @@ impl ZkLspServer {
             return false;
         };
         let config = self.current_config().await;
-        is_scoped_note_path(&config, &path)
+        is_workspace_document_path(&config, &path)
     }
 
     async fn publish_diagnostics(&self, uri: Url, content: &str) {
         let file_path = uri.to_file_path().unwrap_or_default();
         let config = self.current_config().await;
-        if !is_scoped_note_path(&config, &file_path) {
+        if !is_workspace_document_path(&config, &file_path) {
             self.client.publish_diagnostics(uri, Vec::new(), None).await;
+            return;
+        }
+        if is_metadata_path(&config, &file_path) {
+            self.client
+                .publish_diagnostics(
+                    uri,
+                    diagnostics::get_metadata_index_diagnostics_with_context(
+                        content,
+                        &config.zk_config.metadata.fields,
+                        Some(&config.note_dir),
+                    ),
+                    None,
+                )
+                .await;
             return;
         }
 
         let mut diags = diagnostics::get_diagnostics(content, &self.index, uri.path());
-        diags.extend(diagnostics::get_schema_diagnostics(content, &self.index));
+        diags.extend(diagnostics::get_schema_diagnostics_for_note(
+            content,
+            path_note_id(&file_path),
+        ));
+        diags.extend(get_note_metadata_diagnostics(content, &config).await);
         if let Ok(reconcile_diags) =
             reconcile::collect_diagnostics(&config, Some((&file_path, content))).await
         {
@@ -85,6 +103,13 @@ impl ZkLspServer {
         uri.to_file_path()
             .ok()
             .and_then(|path| std::fs::read_to_string(path).ok())
+    }
+
+    async fn read_metadata_document(&self, config: &WikiConfig) -> Option<(Url, String)> {
+        let path = metadata::metadata_path(&config.root);
+        let uri = Url::from_file_path(&path).ok()?;
+        let content = self.read_document(&uri).await?;
+        Some((uri, content))
     }
 }
 
@@ -153,14 +178,32 @@ impl LanguageServer for ZkLspServer {
                     for (uri, content) in open_documents.read().await.iter() {
                         let file_path = uri.to_file_path().unwrap_or_default();
                         let current_config = config.read().await.clone();
-                        if !is_scoped_note_path(&current_config, &file_path) {
+                        if !is_workspace_document_path(&current_config, &file_path) {
                             client
                                 .publish_diagnostics(uri.clone(), Vec::new(), None)
                                 .await;
                             continue;
                         }
+                        if is_metadata_path(&current_config, &file_path) {
+                            client
+                                .publish_diagnostics(
+                                    uri.clone(),
+                                    diagnostics::get_metadata_index_diagnostics_with_context(
+                                        content,
+                                        &current_config.zk_config.metadata.fields,
+                                        Some(&current_config.note_dir),
+                                    ),
+                                    None,
+                                )
+                                .await;
+                            continue;
+                        }
                         let mut diags = diagnostics::get_diagnostics(content, &index, uri.path());
-                        diags.extend(diagnostics::get_schema_diagnostics(content, &index));
+                        diags.extend(diagnostics::get_schema_diagnostics_for_note(
+                            content,
+                            path_note_id(&file_path),
+                        ));
+                        diags.extend(get_note_metadata_diagnostics(content, &current_config).await);
                         if let Ok(reconcile_diags) = reconcile::collect_diagnostics(
                             &current_config,
                             Some((&file_path, content)),
@@ -217,6 +260,11 @@ impl LanguageServer for ZkLspServer {
             .insert(uri.clone(), content.clone());
         // Update index for this file
         if let Ok(path) = uri.to_file_path() {
+            let config = self.current_config().await;
+            if !is_scoped_note_path(&config, &path) {
+                self.publish_diagnostics(uri, &content).await;
+                return;
+            }
             let _ = self.index.update_file(&path).await;
         }
         self.publish_diagnostics(uri, &content).await;
@@ -271,6 +319,17 @@ impl LanguageServer for ZkLspServer {
 
         // Update index
         if let Ok(path) = uri.to_file_path() {
+            let config = self.current_config().await;
+            if is_metadata_path(&config, &path) {
+                self.publish_diagnostics(uri.clone(), &content).await;
+                let _ = self.index.rebuild_full().await;
+                let _ = self.client.inlay_hint_refresh().await;
+                return;
+            }
+            if !is_scoped_note_path(&config, &path) {
+                self.publish_diagnostics(uri.clone(), &content).await;
+                return;
+            }
             let _ = self.index.update_file(&path).await;
         }
 
@@ -289,8 +348,16 @@ impl LanguageServer for ZkLspServer {
             let uri = change.uri.clone();
             if let Ok(path) = uri.to_file_path() {
                 let config = self.current_config().await;
-                if !is_scoped_note_path(&config, &path) {
+                if !is_workspace_document_path(&config, &path) {
                     self.client.publish_diagnostics(uri, Vec::new(), None).await;
+                    continue;
+                }
+                if is_metadata_path(&config, &path) {
+                    if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                        self.publish_diagnostics(uri, &content).await;
+                    }
+                    let _ = self.index.rebuild_full().await;
+                    let _ = self.client.inlay_hint_refresh().await;
                     continue;
                 }
 
@@ -325,9 +392,25 @@ impl LanguageServer for ZkLspServer {
 
         let position = params.text_document_position_params.position;
         let content = self.read_document(uri).await.unwrap_or_default();
+        let config = self.current_config().await;
+        let path = uri.to_file_path().unwrap_or_default();
 
-        Ok(definition::get_definition(&content, position, &self.index)
-            .map(GotoDefinitionResponse::Scalar))
+        let location = if is_metadata_path(&config, &path) {
+            definition::get_metadata_definition(&content, position, &self.index)
+        } else {
+            self.read_metadata_document(&config).await.and_then(
+                |(metadata_uri, metadata_content)| {
+                    definition::get_note_definition(
+                        &content,
+                        position,
+                        &metadata_uri,
+                        &metadata_content,
+                    )
+                },
+            )
+        };
+
+        Ok(location.map(GotoDefinitionResponse::Scalar))
     }
 
     // -----------------------------------------------------------------------
@@ -340,13 +423,24 @@ impl LanguageServer for ZkLspServer {
             return Ok(None);
         }
 
-        let row = params.text_document_position.position.line as usize;
         let content = match self.read_document(uri).await {
             Some(c) => c,
             None => return Ok(None),
         };
-        let line = content.lines().nth(row).unwrap_or("");
-        let locs = references::find_references(&self.index, uri, line);
+        let config = self.current_config().await;
+        let Some((metadata_uri, metadata_content)) = self.read_metadata_document(&config).await
+        else {
+            return Ok(Some(Vec::new()));
+        };
+        let locs = references::find_references(
+            &self.index,
+            uri,
+            &content,
+            params.text_document_position.position,
+            &metadata_uri,
+            &metadata_content,
+            params.context.include_declaration,
+        );
         Ok(Some(locs))
     }
 
@@ -362,11 +456,16 @@ impl LanguageServer for ZkLspServer {
 
         let content = self.read_document(uri).await.unwrap_or_default();
         let mut actions = code_actions::get_code_actions(uri, &params.context.diagnostics);
-        actions.extend(code_actions::get_metadata_actions(
-            uri,
-            &content,
-            params.range,
-        ));
+        if let Ok(path) = uri.to_file_path() {
+            let config = self.current_config().await;
+            if is_metadata_path(&config, &path) {
+                actions.extend(code_actions::get_metadata_actions(
+                    uri,
+                    &content,
+                    params.range,
+                ));
+            }
+        }
         Ok(Some(actions))
     }
 
@@ -382,7 +481,17 @@ impl LanguageServer for ZkLspServer {
 
         let position = params.text_document_position.position;
         let content = self.read_document(uri).await.unwrap_or_default();
-        let items = completion::get_completions(&content, position, &self.index);
+        let config = self.current_config().await;
+        let path = uri.to_file_path().unwrap_or_default();
+        if !is_metadata_path(&config, &path) {
+            return Ok(None);
+        }
+        let items = completion::get_metadata_completions(
+            &content,
+            position,
+            &self.index,
+            &config.zk_config.metadata.fields,
+        );
         Ok(if items.is_empty() {
             None
         } else {
@@ -402,7 +511,12 @@ impl LanguageServer for ZkLspServer {
 
         let position = params.text_document_position_params.position;
         let content = self.read_document(uri).await.unwrap_or_default();
-        Ok(hover::get_hover(&content, position, &self.index))
+        let config = self.current_config().await;
+        let path = uri.to_file_path().unwrap_or_default();
+        if !is_metadata_path(&config, &path) {
+            return Ok(None);
+        }
+        Ok(hover::get_metadata_hover(&content, position, &self.index))
     }
 
     // -----------------------------------------------------------------------
@@ -470,6 +584,15 @@ impl LanguageServer for ZkLspServer {
             }
             "zk.newNote" => {
                 let config = self.current_config().await;
+                if self.metadata_document_is_dirty(&config).await {
+                    self.client
+                        .show_message(
+                            MessageType::WARNING,
+                            "Save metadata.toml before running zk.newNote",
+                        )
+                        .await;
+                    return Ok(None);
+                }
                 match note_ops::create_note(&config, None, &MetaOverrides::new(), None, None).await
                 {
                     Ok(path) => {
@@ -487,6 +610,15 @@ impl LanguageServer for ZkLspServer {
             "zk.removeNote" => {
                 if let Some(id) = params.arguments.first().and_then(|v| v.as_str()) {
                     let config = self.current_config().await;
+                    if self.metadata_document_is_dirty(&config).await {
+                        self.client
+                            .show_message(
+                                MessageType::WARNING,
+                                "Save metadata.toml before running zk.removeNote",
+                            )
+                            .await;
+                        return Ok(None);
+                    }
                     match note_ops::delete_note(id, &config).await {
                         Ok(()) => info!("deleted note {id}"),
                         Err(e) => error!("delete_note: {e}"),
@@ -529,11 +661,96 @@ impl LanguageServer for ZkLspServer {
     }
 }
 
+impl ZkLspServer {
+    async fn metadata_document_is_dirty(&self, config: &WikiConfig) -> bool {
+        let documents = self.open_documents.read().await;
+        metadata_document_is_dirty(&documents, config)
+    }
+}
+
 fn is_scoped_note_path(config: &WikiConfig, path: &std::path::Path) -> bool {
     let note_dir = absolute_path(&config.note_dir);
     let path = absolute_path(path);
 
     path.extension().and_then(|e| e.to_str()) == Some("typ") && path.starts_with(&note_dir)
+}
+
+fn is_metadata_path(config: &WikiConfig, path: &std::path::Path) -> bool {
+    absolute_path(path) == absolute_path(&config.root.join("metadata.toml"))
+}
+
+fn is_workspace_document_path(config: &WikiConfig, path: &std::path::Path) -> bool {
+    is_scoped_note_path(config, path) || is_metadata_path(config, path)
+}
+
+async fn get_note_metadata_diagnostics(content: &str, config: &WikiConfig) -> Vec<Diagnostic> {
+    let Some(header) = parser::parse_header(content) else {
+        return Vec::new();
+    };
+    match metadata::read_record_table(config, &header.id).await {
+        Ok(table) => {
+            diagnostics::note_metadata_record_message(&table, &config.zk_config.metadata.fields)
+                .map(|message| note_metadata_diagnostic(content, &header, message))
+                .into_iter()
+                .collect()
+        }
+        Err(err) => {
+            let message = if err.chain().any(|cause| {
+                cause
+                    .to_string()
+                    .contains("Missing metadata for current note")
+            }) {
+                "Missing metadata for current note"
+            } else {
+                "Invalid metadata for current note"
+            };
+            vec![note_metadata_diagnostic(content, &header, message)]
+        }
+    }
+}
+
+fn note_metadata_diagnostic(
+    content: &str,
+    header: &parser::NoteHeader,
+    message: &str,
+) -> Diagnostic {
+    let line_text = content.lines().nth(header.title_line_idx).unwrap_or("");
+    Diagnostic {
+        range: Range {
+            start: Position {
+                line: header.title_line_idx as u32,
+                character: 0,
+            },
+            end: Position {
+                line: header.title_line_idx as u32,
+                character: line_text.len() as u32,
+            },
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        source: Some("zk-lsp".into()),
+        message: message.to_string(),
+        ..Default::default()
+    }
+}
+
+fn path_note_id(path: &std::path::Path) -> Option<&str> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|id| metadata::is_note_id(id))
+}
+
+fn metadata_document_is_dirty(open_documents: &HashMap<Url, String>, config: &WikiConfig) -> bool {
+    let path = metadata::metadata_path(&config.root);
+    let Some(uri) = Url::from_file_path(&path).ok() else {
+        return false;
+    };
+    let Some(open_content) = open_documents.get(&uri) else {
+        return false;
+    };
+    match std::fs::read_to_string(path) {
+        Ok(disk_content) => disk_content != *open_content,
+        Err(_) => true,
+    }
 }
 
 fn absolute_path(path: &std::path::Path) -> std::path::PathBuf {
@@ -594,11 +811,15 @@ fn position_to_byte_offset(content: &str, position: Position) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_content_changes, is_scoped_note_path, position_to_byte_offset};
+    use super::{
+        apply_content_changes, is_scoped_note_path, metadata_document_is_dirty,
+        position_to_byte_offset,
+    };
     use crate::config::WikiConfig;
     use crate::parser;
+    use std::collections::HashMap;
     use std::path::PathBuf;
-    use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+    use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent, Url};
 
     #[test]
     fn scoped_note_path_only_accepts_typst_files_under_note_dir() {
@@ -618,6 +839,26 @@ mod tests {
             &config,
             &PathBuf::from("/tmp/zk-lsp-scope-test/wiki-notes/note/2605220949.typ")
         ));
+    }
+
+    #[test]
+    fn metadata_document_dirty_detects_unsaved_open_buffer() {
+        let root = std::env::temp_dir().join(format!("zk-lsp-server-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let metadata_path = root.join("metadata.toml");
+        std::fs::write(&metadata_path, "format-version = 1\n").unwrap();
+        let config = WikiConfig::from_root(root.clone());
+        let uri = Url::from_file_path(&metadata_path).unwrap();
+        let mut open = HashMap::new();
+
+        open.insert(uri.clone(), "format-version = 1\n".to_string());
+        assert!(!metadata_document_is_dirty(&open, &config));
+
+        open.insert(uri, "format-version = 1\n# unsaved\n".to_string());
+        assert!(metadata_document_is_dirty(&open, &config));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

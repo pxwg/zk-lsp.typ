@@ -23,7 +23,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::config::WikiConfig;
 use crate::dependency_graph::{self, CycleEdgeOccurrence, DependencyGraph};
-use crate::handlers::formatting::apply_metadata_patch;
+use crate::metadata;
 
 use self::default_module::load_module;
 use self::materialize::materialize;
@@ -55,7 +55,8 @@ pub struct ReconcileStats {
 
 pub async fn run_reconcile(config: &WikiConfig, dry_run: bool) -> Result<ReconcileStats> {
     let notes = scan_notes(&config.note_dir).await?;
-    let (eval_result, diagnostics) = evaluate_workspace(&notes, config)?;
+    let metadata_records = metadata::read_records(config).await?;
+    let (eval_result, diagnostics) = evaluate_workspace(&notes, &metadata_records, config)?;
 
     if !diagnostics.is_empty() {
         return Err(anyhow::anyhow!(render_diagnostics(&diagnostics, &notes)));
@@ -71,9 +72,7 @@ pub async fn run_reconcile(config: &WikiConfig, dry_run: bool) -> Result<Reconci
             .map(|(cid, writeback)| (cid.line_idx, *writeback))
             .collect();
 
-        let after_checked = normalize_note_from_checked(content, &checked_by_line);
-        let new_content = apply_materialized_metadata(&_id, &after_checked, &reconcile_result)?
-            .unwrap_or_else(|| after_checked.clone());
+        let new_content = normalize_note_from_checked(content, &checked_by_line);
         if new_content != *content {
             files_changed += 1;
             if !dry_run {
@@ -83,6 +82,21 @@ pub async fn run_reconcile(config: &WikiConfig, dry_run: bool) -> Result<Reconci
                 tokio::fs::rename(&tmp, path).await?;
             } else {
                 eprintln!("  would update: {}", path.display());
+            }
+        }
+    }
+
+    let metadata_patches = materialized_metadata_patches(&reconcile_result);
+    if !metadata_patches.is_empty() {
+        files_changed += 1;
+        if dry_run {
+            eprintln!(
+                "  would update: {}",
+                metadata::metadata_path(&config.root).display()
+            );
+        } else {
+            for (id, patch) in metadata_patches {
+                metadata::patch_record(config, &id, &patch).await?;
             }
         }
     }
@@ -109,33 +123,25 @@ pub async fn collect_diagnostics(
         }
     }
 
-    let (_, diagnostics) = evaluate_workspace(&notes, config)?;
+    let metadata_records = metadata::read_records(config).await.unwrap_or_default();
+    let (_, diagnostics) = evaluate_workspace(&notes, &metadata_records, config)?;
     Ok(diagnostics)
 }
 
-fn apply_materialized_metadata(
-    note_id: &str,
-    content: &str,
+fn materialized_metadata_patches(
     reconcile_result: &materialize::ReconcileResult,
-) -> Result<Option<String>> {
-    let mut patch = HashMap::new();
-    for ((materialized_note_id, field), value) in &reconcile_result.materialized_meta {
-        if materialized_note_id != note_id {
-            continue;
-        }
+) -> HashMap<NoteId, HashMap<String, toml::Value>> {
+    let mut patches: HashMap<NoteId, HashMap<String, toml::Value>> = HashMap::new();
+    for ((note_id, field), value) in &reconcile_result.materialized_meta {
         let Some(toml_value) = value_to_toml(value) else {
             continue;
         };
-        patch.insert(field.clone(), toml_value);
+        patches
+            .entry(note_id.clone())
+            .or_default()
+            .insert(field.clone(), toml_value);
     }
-    if patch.is_empty() {
-        return Ok(None);
-    }
-    apply_metadata_patch(content, &patch)
-        .map(Some)
-        .map_err(|err| {
-            anyhow::anyhow!("failed to write materialized metadata for note {note_id}: {err}")
-        })
+    patches
 }
 
 fn value_to_toml(value: &Value) -> Option<toml::Value> {
@@ -187,10 +193,14 @@ async fn scan_notes(note_dir: &std::path::Path) -> Result<HashMap<NoteId, (PathB
 
 fn evaluate_workspace(
     notes: &HashMap<NoteId, (PathBuf, String)>,
+    metadata_records: &HashMap<NoteId, metadata::MetadataRecord>,
     config: &WikiConfig,
 ) -> Result<(eval::EvalResult, Vec<ReconcileDiagnostic>)> {
-    let snapshot =
-        WorkspaceSnapshot::from_note_map_with_metadata(notes, &config.zk_config.metadata.fields);
+    let snapshot = WorkspaceSnapshot::from_note_map_with_metadata_records(
+        notes,
+        metadata_records,
+        &config.zk_config.metadata.fields,
+    );
     let module = load_module(
         &config.zk_config.reconcile_rules,
         config.zk_config.disable_default_reconcile_rules,
@@ -463,6 +473,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::metadata::MetadataRecord;
+    use crate::parser::{ChecklistStatus, Relation};
     use crate::reconcile::default_module::load_module;
     use crate::reconcile::eval::eval_all;
     use crate::reconcile::observe::WorkspaceSnapshot;
@@ -470,17 +482,10 @@ mod tests {
     use crate::reconcile::types::{DiagnosticKind, DiagnosticSeverity, Status, Value};
 
     fn make_toml_note(title: &str, id: &str, status: &str, body: &str) -> String {
+        let _ = status;
         format!(
             "#import \"../include.typ\": *\n\
-             #let zk-metadata = toml(bytes(\n\
-             \x20 ```toml\n\
-             \x20 schema-version = 1\n\
-             \x20 title = \"{title}\"\n\
-             \x20 tags = []\n\
-             \x20 checklist-status = \"{status}\"\n\
-             \x20 generated = false\n\
-             \x20 ```.text,\n\
-             ))\n\
+             #let zk-metadata = zk_metadata(\"{id}\")\n\
              #show: zettel.with(metadata: zk-metadata)\n\
              \n\
              = {title} <{id}>\n\
@@ -499,6 +504,58 @@ mod tests {
             })
             .collect();
         WorkspaceSnapshot::from_note_map(&map)
+    }
+
+    fn snapshot_from_records(
+        notes: &[(&str, &str)],
+        records: &[(&str, Status, Relation)],
+    ) -> WorkspaceSnapshot {
+        let map: HashMap<NoteId, (PathBuf, String)> = notes
+            .iter()
+            .map(|(id, content)| {
+                (
+                    id.to_string(),
+                    (PathBuf::from(format!("{id}.typ")), content.to_string()),
+                )
+            })
+            .collect();
+        let metadata_records: HashMap<NoteId, MetadataRecord> = records
+            .iter()
+            .map(|(id, status, relation)| {
+                (
+                    id.to_string(),
+                    MetadataRecord {
+                        checklist_status: match status {
+                            Status::Done => ChecklistStatus::Done,
+                            Status::Wip => ChecklistStatus::Wip,
+                            Status::Todo => ChecklistStatus::Todo,
+                            Status::None => ChecklistStatus::None,
+                        },
+                        relation: relation.clone(),
+                        ..MetadataRecord::default()
+                    },
+                )
+            })
+            .collect();
+        WorkspaceSnapshot::from_note_map_with_metadata_records(&map, &metadata_records, &[])
+    }
+
+    fn write_metadata_index(root: &std::path::Path, ids: &[&str]) {
+        let mut content = String::from("format-version = 1\n\n");
+        for id in ids {
+            content.push_str(&format!(
+                "[notes.\"{id}\"]\n\
+                 schema-version = 1\n\
+                 aliases = []\n\
+                 abstract = \"\"\n\
+                 keywords = []\n\
+                 generated = true\n\
+                 checklist-status = \"none\"\n\
+                 relation = \"active\"\n\
+                 relation-target = []\n\n"
+            ));
+        }
+        std::fs::write(root.join("metadata.toml"), content).expect("write metadata.toml");
     }
 
     fn note_map(notes: &[(&str, String)]) -> HashMap<NoteId, (PathBuf, String)> {
@@ -545,7 +602,10 @@ mod tests {
         let b = make_toml_note("B", "2020202020", "none", "- [ ] @1010101010\n");
         let c = make_toml_note("C", "3030303030", "none", "- [ ] @2020202020\n");
 
-        let snap = snapshot_from(&[("1010101010", &a), ("2020202020", &b), ("3030303030", &c)]);
+        let snap = snapshot_from_records(
+            &[("1010101010", &a), ("2020202020", &b), ("3030303030", &c)],
+            &[("1010101010", Status::Done, Relation::Active)],
+        );
         let module = load_test_module();
         let eval_result = eval_all(&module, &snap);
         let result = materialize(eval_result);
@@ -569,10 +629,6 @@ mod tests {
             Some(&Value::Status(Status::Done))
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Migrated tests from old reconcile.rs
-    // -----------------------------------------------------------------------
 
     #[test]
     fn refitem_rendered_checked_not_source_truth() {
@@ -693,7 +749,10 @@ mod tests {
             "- [ ] @1111111111\n  - [x] child 1\n  - [x] child 2\n",
         );
 
-        let snap = snapshot_from(&[("1111111111", &dep), ("2222222222", &parent)]);
+        let snap = snapshot_from_records(
+            &[("1111111111", &dep), ("2222222222", &parent)],
+            &[("1111111111", Status::Done, Relation::Active)],
+        );
         let module = load_test_module();
         let result = materialize(eval_all(&module, &snap));
 
@@ -737,11 +796,17 @@ mod tests {
             "- [ ] @1111111111\n  - [ ] group\n    - [ ] @3333333333\n",
         );
 
-        let snap = snapshot_from(&[
-            ("1111111111", &top_dep),
-            ("2222222222", &note),
-            ("3333333333", &leaf_dep),
-        ]);
+        let snap = snapshot_from_records(
+            &[
+                ("1111111111", &top_dep),
+                ("2222222222", &note),
+                ("3333333333", &leaf_dep),
+            ],
+            &[
+                ("1111111111", Status::Done, Relation::Active),
+                ("3333333333", Status::Done, Relation::Active),
+            ],
+        );
         let module = load_test_module();
         let result = materialize(eval_all(&module, &snap));
 
@@ -751,15 +816,6 @@ mod tests {
                 .get(&("2222222222".to_string(), "checklist-status".to_string())),
             Some(&Value::Status(Status::Done))
         );
-    }
-
-    #[test]
-    fn no_checklist_note_uses_metadata_status() {
-        use crate::reconcile::writeback::is_note_done_with_deps;
-        let content_done = make_toml_note("D", "4444444444", "done", "");
-        let content_none = make_toml_note("N", "5555555555", "none", "");
-        assert!(is_note_done_with_deps(&content_done, &HashMap::new()));
-        assert!(!is_note_done_with_deps(&content_none, &HashMap::new()));
     }
 
     #[test]
@@ -826,6 +882,7 @@ mod tests {
             make_toml_note("B", "2222222222", "none", "- [ ] @1111111111\n"),
         )
         .expect("write note b");
+        write_metadata_index(&root, &["1111111111", "2222222222"]);
 
         let config = make_test_config(root.clone());
         let diagnostics = collect_diagnostics(&config, None)
@@ -866,6 +923,7 @@ mod tests {
             make_toml_note("B", "2222222222", "none", "- [ ] @1111111111\n"),
         )
         .expect("write note b");
+        write_metadata_index(&root, &["1111111111", "2222222222"]);
 
         let config = make_test_config(root.clone());
         let err = run_reconcile(&config, true)
@@ -889,10 +947,13 @@ mod tests {
         let module = load_test_module();
         let result = materialize(eval_all(&module, &snap));
 
-        let updated = apply_materialized_metadata("1111111111", &note, &result)
-            .expect("status edit")
-            .expect("metadata change");
-        assert!(updated.contains("checklist-status = \"done\""));
+        let patches = materialized_metadata_patches(&result);
+        assert_eq!(
+            patches
+                .get("1111111111")
+                .and_then(|patch| patch.get("checklist-status")),
+            Some(&toml::Value::String("done".into()))
+        );
         assert_eq!(
             result
                 .materialized_meta
@@ -919,28 +980,20 @@ mod tests {
                     (observe_meta n field)))))
         "#;
         let module = parse_module(src).expect("parse");
-        let note = "#import \"../include.typ\": *\n\
-             #let zk-metadata = toml(bytes(\n\
-             \x20 ```toml\n\
-             \x20 schema-version = 1\n\
-             \x20 title = \"A\"\n\
-             \x20 tags = []\n\
-             \x20 checklist-status = \"none\"\n\
-             \x20 user.label = \"stale\"\n\
-             \x20 generated = false\n\
-             \x20 ```.text,\n\
-             ))\n\
-             #show: zettel.with(metadata: zk-metadata)\n\
-             \n\
-             = A <1111111111>\n";
-        let snap = snapshot_from(&[("1111111111", note)]);
+        let note = make_toml_note("A", "1111111111", "none", "");
+        let snap = snapshot_from(&[("1111111111", &note)]);
         let result = materialize(eval_all(&module, &snap));
-        let updated = apply_materialized_metadata("1111111111", note, &result)
-            .expect("metadata edit")
-            .expect("metadata change");
+        let patches = materialized_metadata_patches(&result);
+        let patch = patches.get("1111111111").expect("metadata patch");
 
-        assert!(updated.contains("checklist-status = \"done\""));
-        assert!(updated.contains("user.label = \"synced\""));
+        assert_eq!(
+            patch.get("checklist-status"),
+            Some(&toml::Value::String("done".into()))
+        );
+        assert_eq!(
+            patch.get("user.label"),
+            Some(&toml::Value::String("synced".into()))
+        );
     }
 
     #[test]
@@ -959,29 +1012,15 @@ mod tests {
                 (observe_meta n field))))
         "#;
         let module = parse_module(src).expect("parse");
-        let note = "#import \"../include.typ\": *\n\
-             #let zk-metadata = toml(bytes(\n\
-             \x20 ```toml\n\
-             \x20 schema-version = 1\n\
-             \x20 aliases = []\n\
-             \x20 abstract = \"\"\n\
-             \x20 keywords = []\n\
-             \x20 checklist-status = \"none\"\n\
-             \x20 relation = \"active\"\n\
-             \x20 relation-target = []\n\
-             \x20 generated = false\n\
-             \x20 ```.text,\n\
-             ))\n\
-             #show: zettel.with(metadata: zk-metadata)\n\
-             \n\
-             = A <1111111111>\n";
-        let snap = snapshot_from(&[("1111111111", note)]);
+        let note = make_toml_note("A", "1111111111", "none", "");
+        let snap = snapshot_from(&[("1111111111", &note)]);
         let result = materialize(eval_all(&module, &snap));
-        let updated = apply_materialized_metadata("1111111111", note, &result)
-            .expect("materialize metadata")
-            .expect("metadata edit");
+        let patches = materialized_metadata_patches(&result);
+        let patch = patches.get("1111111111").expect("metadata patch");
 
-        assert!(updated.contains("  [user]"));
-        assert!(updated.contains("  label = \"synced\""));
+        assert_eq!(
+            patch.get("user.label"),
+            Some(&toml::Value::String("synced".into()))
+        );
     }
 }

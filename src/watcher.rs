@@ -10,7 +10,7 @@ use tracing::{error, info};
 
 use crate::config::WikiConfig;
 use crate::index::NoteIndex;
-use crate::link_gen;
+use crate::{link_gen, metadata};
 
 /// Start the filesystem watcher on note_dir.
 /// Sends events (Create / Modify / Remove) to the returned receiver.
@@ -20,9 +20,12 @@ pub async fn start_watcher(
 ) -> Result<tokio::task::JoinHandle<()>> {
     let (tx, mut rx) = mpsc::channel::<Vec<DebouncedEvent>>(64);
 
-    let note_dir = {
+    let (note_dir, metadata_path) = {
         let config = config.read().await;
-        config.note_dir.clone()
+        (
+            config.note_dir.clone(),
+            metadata::metadata_path(&config.root),
+        )
     };
 
     // Spawn the blocking watcher thread
@@ -34,6 +37,12 @@ pub async fn start_watcher(
             .watcher()
             .watch(&note_dir, RecursiveMode::NonRecursive)
             .expect("watch note_dir");
+        if let Some(root) = metadata_path.parent() {
+            debouncer
+                .watcher()
+                .watch(root, RecursiveMode::NonRecursive)
+                .expect("watch metadata.toml parent");
+        }
 
         for result in fs_rx {
             match result {
@@ -51,6 +60,12 @@ pub async fn start_watcher(
         while let Some(events) = rx.recv().await {
             for event in events {
                 let path = event.path.clone();
+                let config_snapshot = { config.read().await.clone() };
+                if path == metadata::metadata_path(&config_snapshot.root) {
+                    info!("metadata index changed: {}", path.display());
+                    let _ = index.rebuild_full().await;
+                    continue;
+                }
                 if !is_note_file(&path) {
                     continue;
                 }
@@ -62,7 +77,6 @@ pub async fn start_watcher(
                         .and_then(|s| s.to_str())
                         .unwrap_or("")
                         .to_string();
-                    let config_snapshot = { config.read().await.clone() };
                     let _ = link_gen::add_entry(&id, &config_snapshot).await;
                 } else {
                     info!("note removed: {}", path.display());
@@ -72,7 +86,6 @@ pub async fn start_watcher(
                         .and_then(|s| s.to_str())
                         .unwrap_or("")
                         .to_string();
-                    let config_snapshot = { config.read().await.clone() };
                     let _ = link_gen::remove_entry(&id, &config_snapshot).await;
                 }
             }

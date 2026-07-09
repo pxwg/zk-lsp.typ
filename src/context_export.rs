@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::config::WikiConfig;
+use crate::metadata;
 use crate::note_info;
 use crate::parser::{self, ChecklistStatus, Relation};
 
@@ -24,6 +25,9 @@ pub async fn export_context(
     config: &WikiConfig,
 ) -> anyhow::Result<String> {
     let reverse_map = build_reverse_map(config).await;
+    let metadata_snapshot = metadata::MetadataSnapshot::load(config)
+        .await
+        .unwrap_or_else(metadata::MetadataSnapshot::unavailable);
 
     let mut queue: VecDeque<(String, usize)> = VecDeque::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -40,31 +44,24 @@ pub async fn export_context(
             Err(_) => continue,
         };
 
-        let header = parser::parse_header(&content);
+        let header = parser::parse_header(&content).filter(|header| header.id == id);
+        let metadata_record = metadata_snapshot.record(&id).ok();
         let title = header.as_ref().map(|h| h.title.clone()).unwrap_or_default();
-        let abstract_text = header
+        let abstract_text = metadata_record
             .as_ref()
-            .and_then(|h| h.abstract_text.clone())
+            .and_then(|m| m.abstract_text.clone())
             .unwrap_or_default();
-        let keywords = header
+        let keywords = metadata_record
             .as_ref()
-            .map(|h| h.keywords.clone())
+            .map(|m| m.keywords.clone())
             .unwrap_or_default();
-        let checklist_status = header
+        let checklist_status = metadata_record
             .as_ref()
-            .and_then(|h| h.checklist_status.clone())
+            .map(|m| m.checklist_status.clone())
             .unwrap_or(ChecklistStatus::None);
-        let relation = header
+        let relation = metadata_record
             .as_ref()
-            .map(|h| {
-                if h.archived {
-                    Relation::Archived
-                } else if h.legacy {
-                    Relation::Legacy
-                } else {
-                    Relation::Active
-                }
-            })
+            .map(|m| m.relation.clone())
             .unwrap_or(Relation::Active);
 
         // Extract outgoing refs (filtered: skips TOML block, comments, fences)
@@ -90,18 +87,18 @@ pub async fn export_context(
 
         let mut sorted_refs = out_refs.clone();
         sorted_refs.sort();
-        let note_info = header.as_ref().map(|h| {
-            let parsed_toml = parser::find_toml_metadata_block(&content)
-                .and_then(|b| parser::parse_toml_metadata(&b.toml_content))
-                .unwrap_or_default();
-            note_info::build_note_info_value(
-                &id,
-                &path,
-                h,
-                &parsed_toml,
-                &config.zk_config.metadata.fields,
-            )
-        });
+        let note_info = header
+            .as_ref()
+            .zip(metadata_record.as_ref())
+            .map(|(h, record)| {
+                note_info::build_note_info_value(
+                    &id,
+                    &path,
+                    h,
+                    record,
+                    &config.zk_config.metadata.fields,
+                )
+            });
 
         sections.push(NoteSection {
             id: id.clone(),
@@ -310,18 +307,8 @@ mod tests {
         let refs_body: String = refs.iter().map(|r| format!("- [ ] @{r}\n")).collect();
         format!(
             "#import \"../include.typ\": *\n\
-             #let zk-metadata = toml(bytes(\"\"\"\n\
-             ```toml\n\
-             schema-version = 1\n\
-             title = \"{title}\"\n\
-             tags = []\n\
-             checklist-status = \"none\"\n\
-             relation = \"active\"\n\
-             relation-target = []\n\
-             generated = false\n\
-             ```\n\
-             \"\"\"))\n\
-             #show: zettel\n\
+             #let zk-metadata = zk_metadata(\"{id}\")\n\
+             #show: zettel.with(metadata: zk-metadata)\n\
              \n\
              = {title} <{id}>\n\
              {refs_body}"
@@ -331,6 +318,27 @@ mod tests {
     fn write_note(dir: &Path, id: &str, title: &str, refs: &[&str]) {
         let content = make_note_content(id, title, refs);
         std::fs::write(dir.join(format!("{id}.typ")), content).unwrap();
+        write_metadata_record(dir.parent().unwrap(), id);
+    }
+
+    fn write_metadata_record(root: &Path, id: &str) {
+        let path = root.join("metadata.toml");
+        if !path.exists() {
+            std::fs::write(&path, "format-version = 1\n\n").unwrap();
+        }
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str(&format!(
+            "[notes.\"{id}\"]\n\
+             schema-version = 1\n\
+             aliases = []\n\
+             abstract = \"\"\n\
+             keywords = []\n\
+             generated = true\n\
+             checklist-status = \"none\"\n\
+             relation = \"active\"\n\
+             relation-target = []\n\n"
+        ));
+        std::fs::write(path, content).unwrap();
     }
 
     fn make_test_dir(suffix: &str) -> std::path::PathBuf {
@@ -380,23 +388,14 @@ mod tests {
         let tmp = make_test_dir("angle_outgoing");
         let content = concat!(
             "#import \"../include.typ\": *\n",
-            "#let zk-metadata = toml(bytes(\"\"\"\n",
-            "```toml\n",
-            "schema-version = 1\n",
-            "title = \"Entry Note\"\n",
-            "tags = []\n",
-            "checklist-status = \"none\"\n",
-            "relation = \"active\"\n",
-            "relation-target = []\n",
-            "generated = false\n",
-            "```\n",
-            "\"\"\"))\n",
-            "#show: zettel\n",
+            "#let zk-metadata = zk_metadata(\"1111111111\")\n",
+            "#show: zettel.with(metadata: zk-metadata)\n",
             "\n",
             "= Entry Note <1111111111>\n",
             "See predecessor <2222222222>\n",
         );
         std::fs::write(tmp.join("note/1111111111.typ"), content).unwrap();
+        write_metadata_record(&tmp, "1111111111");
         write_note(&tmp.join("note"), "2222222222", "Linked Note", &[]);
 
         let config = WikiConfig::from_root(tmp.clone());
@@ -416,23 +415,14 @@ mod tests {
         write_note(&tmp.join("note"), "1111111111", "Entry Note", &[]);
         let content = concat!(
             "#import \"../include.typ\": *\n",
-            "#let zk-metadata = toml(bytes(\"\"\"\n",
-            "```toml\n",
-            "schema-version = 1\n",
-            "title = \"Parent Note\"\n",
-            "tags = []\n",
-            "checklist-status = \"none\"\n",
-            "relation = \"active\"\n",
-            "relation-target = []\n",
-            "generated = false\n",
-            "```\n",
-            "\"\"\"))\n",
-            "#show: zettel\n",
+            "#let zk-metadata = zk_metadata(\"2222222222\")\n",
+            "#show: zettel.with(metadata: zk-metadata)\n",
             "\n",
             "= Parent Note <2222222222>\n",
             "Depends on <1111111111>\n",
         );
         std::fs::write(tmp.join("note/2222222222.typ"), content).unwrap();
+        write_metadata_record(&tmp, "2222222222");
 
         let config = WikiConfig::from_root(tmp.clone());
         let out = export_context("1111111111", 1, true, false, &config)
