@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use futures::{stream, StreamExt};
+
 use crate::config::WikiConfig;
 use crate::config::{metadata_defaults_table, MetadataFieldConfig};
 use crate::metadata::{self, MetadataRecord};
@@ -155,9 +157,22 @@ pub async fn build_notes_json(config: &WikiConfig) -> anyhow::Result<String> {
         .await
         .unwrap_or_else(metadata::MetadataSnapshot::unavailable);
 
-    let mut records = Vec::with_capacity(notes.len());
-    for (id, path) in notes {
-        records.push(build_note_record(&id, &path, config, &metadata_snapshot).await);
+    const READ_CONCURRENCY: usize = 32;
+    let metadata_snapshot = &metadata_snapshot;
+    let results: Vec<NoteRecordResult> = stream::iter(notes)
+        .map(move |(id, path)| async move {
+            build_note_record(&id, &path, config, metadata_snapshot).await
+        })
+        .buffered(READ_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut records = Vec::with_capacity(results.len());
+    for result in results {
+        if let Some(warning) = result.warning {
+            eprintln!("zk-lsp notes: warning: {warning}");
+        }
+        records.push(result.value);
     }
 
     Ok(serde_json::to_string_pretty(&records)?)
@@ -188,14 +203,16 @@ async fn build_note_record(
     path: &Path,
     config: &WikiConfig,
     metadata_snapshot: &metadata::MetadataSnapshot,
-) -> serde_json::Value {
+) -> NoteRecordResult {
     let stat = tokio::fs::metadata(path).await.ok();
     let content = match tokio::fs::read_to_string(path).await {
         Ok(content) => content,
         Err(err) => {
             let message = format!("reading {}: {err}", path.display());
-            eprintln!("zk-lsp notes: warning: {message}");
-            return note_error_value(id, path, &message, stat.as_ref());
+            return NoteRecordResult::warning(
+                note_error_value(id, path, &message, stat.as_ref()),
+                message,
+            );
         }
     };
 
@@ -203,8 +220,10 @@ async fn build_note_record(
         Ok(record) => record,
         Err(err) => {
             let message = err.to_string();
-            eprintln!("zk-lsp notes: warning: {}: {message}", path.display());
-            return note_error_value(id, path, &message, stat.as_ref());
+            return NoteRecordResult::warning(
+                note_error_value(id, path, &message, stat.as_ref()),
+                format!("{}: {message}", path.display()),
+            );
         }
     };
 
@@ -217,12 +236,35 @@ async fn build_note_record(
     ) {
         Ok(mut value) => {
             add_file_stat(&mut value, stat.as_ref());
-            value
+            NoteRecordResult::ok(value)
         }
         Err(err) => {
             let message = err.to_string();
-            eprintln!("zk-lsp notes: warning: {}: {message}", path.display());
-            note_error_value(id, path, &message, stat.as_ref())
+            NoteRecordResult::warning(
+                note_error_value(id, path, &message, stat.as_ref()),
+                format!("{}: {message}", path.display()),
+            )
+        }
+    }
+}
+
+struct NoteRecordResult {
+    value: serde_json::Value,
+    warning: Option<String>,
+}
+
+impl NoteRecordResult {
+    fn ok(value: serde_json::Value) -> Self {
+        Self {
+            value,
+            warning: None,
+        }
+    }
+
+    fn warning(value: serde_json::Value, warning: String) -> Self {
+        Self {
+            value,
+            warning: Some(warning),
         }
     }
 }
