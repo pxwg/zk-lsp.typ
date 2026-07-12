@@ -204,15 +204,11 @@ async fn build_note_record(
     config: &WikiConfig,
     metadata_snapshot: &metadata::MetadataSnapshot,
 ) -> NoteRecordResult {
-    let stat = tokio::fs::metadata(path).await.ok();
-    let content = match tokio::fs::read_to_string(path).await {
-        Ok(content) => content,
+    let (content, stat) = match read_note_with_stat(path).await {
+        Ok(result) => result,
         Err(err) => {
             let message = format!("reading {}: {err}", path.display());
-            return NoteRecordResult::warning(
-                note_error_value(id, path, &message, stat.as_ref()),
-                message,
-            );
+            return NoteRecordResult::warning(note_error_value(id, path, &message, None), message);
         }
     };
 
@@ -246,6 +242,25 @@ async fn build_note_record(
             )
         }
     }
+}
+
+async fn read_note_with_stat(path: &Path) -> anyhow::Result<(String, Option<std::fs::Metadata>)> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+
+        let mut file = std::fs::File::open(path)?;
+        let stat = file.metadata().ok();
+        let mut content = String::with_capacity(
+            stat.as_ref()
+                .and_then(|metadata| usize::try_from(metadata.len()).ok())
+                .unwrap_or(0),
+        );
+        file.read_to_string(&mut content)?;
+        Ok((content, stat))
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("note reader task failed: {err}"))?
 }
 
 struct NoteRecordResult {
