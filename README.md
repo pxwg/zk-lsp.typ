@@ -251,6 +251,8 @@ zk-lsp metadata reset 2602082037 checklist-status user.priority
 
 # Read all notes' canonical metadata/search records in one process
 zk-lsp notes --json
+# Write the same records as compact, directly streamed JSON
+zk-lsp notes --json --compact
 
 # Inspect the metadata schema implied by defaults + loaded config
 zk-lsp config metadata fields --json --sources

@@ -131,9 +131,10 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
-        Command::Notes { json: _ } => {
-            let json = note_info::build_notes_json(&config).await?;
-            println!("{json}");
+        Command::Notes { json: _, compact } => {
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            note_info::write_notes_json(&config, &mut stdout, compact).await?;
         }
         Command::NoteInfo { id, json: _ } => {
             let json = note_info::build_single_note_info_json(&id, &config).await?;

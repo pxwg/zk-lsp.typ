@@ -75,6 +75,9 @@ pub enum Command {
         /// Output JSON (default; kept for explicit script usage)
         #[arg(long)]
         json: bool,
+        /// Emit compact JSON without indentation
+        #[arg(long)]
+        compact: bool,
     },
     /// Initialise a new wiki in the current directory (or --wiki-root)
     Init {

@@ -153,7 +153,28 @@ pub async fn build_single_note_info_json(id: &str, config: &WikiConfig) -> anyho
     )
 }
 
+#[allow(dead_code)]
 pub async fn build_notes_json(config: &WikiConfig) -> anyhow::Result<String> {
+    let records = build_note_values(config).await?;
+    Ok(serde_json::to_string_pretty(&records)?)
+}
+
+pub async fn write_notes_json<W: std::io::Write>(
+    config: &WikiConfig,
+    mut writer: W,
+    compact: bool,
+) -> anyhow::Result<()> {
+    let records = build_note_values(config).await?;
+    if compact {
+        serde_json::to_writer(&mut writer, &records)?;
+    } else {
+        serde_json::to_writer_pretty(&mut writer, &records)?;
+    }
+    writer.write_all(b"\n")?;
+    Ok(())
+}
+
+async fn build_note_values(config: &WikiConfig) -> anyhow::Result<Vec<serde_json::Value>> {
     let mut notes = collect_note_paths(&config.note_dir).await?;
     notes.sort_by(|(id_a, path_a), (id_b, path_b)| id_a.cmp(id_b).then_with(|| path_a.cmp(path_b)));
     let metadata_snapshot = metadata::MetadataSnapshot::load(config)
@@ -201,7 +222,7 @@ pub async fn build_notes_json(config: &WikiConfig) -> anyhow::Result<String> {
     }
     NotesCache::save(cache_path, cache_context, next_cache_records).await;
 
-    Ok(serde_json::to_string_pretty(&records)?)
+    Ok(records)
 }
 
 async fn collect_note_paths(note_dir: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {
@@ -508,7 +529,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{build_note_info_value, build_notes_json};
+    use super::{build_note_info_value, build_notes_json, write_notes_json};
     use crate::config::WikiConfig;
     use crate::config::{MetadataFieldConfig, MetadataFieldKind};
     use crate::metadata::MetadataRecord;
@@ -792,5 +813,26 @@ default = "normal"
             serde_json::from_str::<serde_json::Value>(&third).unwrap()[0]["metadata"]["relation"],
             "archived"
         );
+    }
+
+    #[tokio::test]
+    async fn notes_json_writer_supports_pretty_and_compact_output() {
+        let root = make_test_root("streaming_output");
+        write_note(&root, "1111111111", "First", "");
+        let config = WikiConfig::from_root(root.clone());
+
+        let mut pretty = Vec::new();
+        write_notes_json(&config, &mut pretty, false).await.unwrap();
+        let mut compact = Vec::new();
+        write_notes_json(&config, &mut compact, true).await.unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&pretty).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(&compact).unwrap()
+        );
+        assert!(compact.len() < pretty.len());
+        assert!(pretty.ends_with(b"\n"));
+        assert!(compact.ends_with(b"\n"));
     }
 }
