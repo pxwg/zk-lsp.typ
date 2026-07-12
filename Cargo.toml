@@ -34,6 +34,14 @@ toml = "0.8"
 unicode-width = "0.2"
 mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+tempfile = "3"
+
+[[bench]]
+name = "notes_json"
+harness = false
+
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
 bin-dir = "{ bin }{ binary-ext }"
