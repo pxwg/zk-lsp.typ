@@ -5,6 +5,9 @@ use regex::Regex;
 pub(crate) static RE_ID_REF: Lazy<Regex> = Lazy::new(|| Regex::new(r"@(\d{10})").unwrap());
 pub(crate) static RE_ANGLE_ID: Lazy<Regex> = Lazy::new(|| Regex::new(r"<(\d{10})>").unwrap());
 pub(crate) static RE_TITLE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^=\s+.*<(\d{10})>").unwrap());
+static RE_BINDING: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"^\s*#let\s+zk-metadata\s*=\s*zk_metadata\("(\d{10})"\)\s*$"#).unwrap()
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChecklistStatus {
@@ -69,10 +72,6 @@ pub struct RefOccurrence {
 /// Scan `content` for a canonical central metadata binding:
 /// `#let zk-metadata = zk_metadata("ID")`.
 pub fn find_metadata_binding(content: &str) -> Option<MetadataBinding> {
-    static RE_BINDING: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r#"^\s*#let\s+zk-metadata\s*=\s*zk_metadata\("(\d{10})"\)\s*$"#).unwrap()
-    });
-
     let mut found = None;
     for (line_idx, line) in content.lines().enumerate() {
         let Some(caps) = RE_BINDING.captures(line) else {
@@ -91,32 +90,43 @@ pub fn find_metadata_binding(content: &str) -> Option<MetadataBinding> {
 
 /// Parse the structural header of a central-metadata note.
 pub fn parse_header(content: &str) -> Option<NoteHeader> {
-    let lines: Vec<&str> = content.lines().collect();
+    let mut binding = None;
+    let mut title = None;
 
-    let title_line_idx = lines.iter().position(|l| RE_TITLE.is_match(l))?;
+    for (line_idx, line) in content.lines().enumerate() {
+        if let Some(captures) = RE_BINDING.captures(line) {
+            if binding.is_some() {
+                return None;
+            }
+            binding = Some(MetadataBinding {
+                line_idx,
+                id: captures.get(1)?.as_str().to_string(),
+            });
+        }
 
-    let title_line = lines[title_line_idx];
-    let id = RE_TITLE.captures(title_line)?.get(1)?.as_str().to_string();
-    let title = RE_TITLE
-        .captures(title_line)?
-        .get(0)?
-        .as_str()
-        .trim_start_matches('=')
-        .trim()
-        .rsplit_once('<')
-        .map(|(t, _)| t.trim().to_string())
-        .unwrap_or_default();
-
-    let binding = find_metadata_binding(content)?;
-    if binding.line_idx >= title_line_idx || binding.id != id {
-        return None;
+        if title.is_none() {
+            if let Some(captures) = RE_TITLE.captures(line) {
+                let matched = captures.get(0)?.as_str();
+                title = Some(NoteHeader {
+                    id: captures.get(1)?.as_str().to_string(),
+                    title: matched
+                        .trim_start_matches('=')
+                        .trim()
+                        .rsplit_once('<')
+                        .map(|(title, _)| title.trim().to_string())
+                        .unwrap_or_default(),
+                    title_line_idx: line_idx,
+                });
+            }
+        }
     }
 
-    Some(NoteHeader {
-        id,
-        title,
-        title_line_idx,
-    })
+    let binding = binding?;
+    let title = title?;
+    if binding.line_idx >= title.title_line_idx || binding.id != title.id {
+        return None;
+    }
+    Some(title)
 }
 
 // ---------------------------------------------------------------------------
