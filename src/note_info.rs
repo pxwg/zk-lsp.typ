@@ -1,7 +1,10 @@
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use futures::{stream, StreamExt};
+use serde::{Deserialize, Serialize};
 
 use crate::config::WikiConfig;
 use crate::config::{metadata_defaults_table, MetadataFieldConfig};
@@ -156,24 +159,47 @@ pub async fn build_notes_json(config: &WikiConfig) -> anyhow::Result<String> {
     let metadata_snapshot = metadata::MetadataSnapshot::load(config)
         .await
         .unwrap_or_else(metadata::MetadataSnapshot::unavailable);
+    let cache_context = CacheContext::load(config).await;
+    let cache_path = config.root.join(".zk-lsp/notes-v1.json");
+    let cache = NotesCache::load(&cache_path, &cache_context).await;
 
     const READ_CONCURRENCY: usize = 32;
     let metadata_snapshot = &metadata_snapshot;
+    let cached_records = &cache.records;
     let results: Vec<NoteRecordResult> = stream::iter(notes)
         .map(move |(id, path)| async move {
-            build_note_record(&id, &path, config, metadata_snapshot).await
+            build_note_record(
+                &id,
+                &path,
+                config,
+                metadata_snapshot,
+                cached_records.get(&id),
+            )
+            .await
         })
         .buffered(READ_CONCURRENCY)
         .collect()
         .await;
 
     let mut records = Vec::with_capacity(results.len());
+    let mut next_cache_records = HashMap::with_capacity(results.len());
     for result in results {
-        if let Some(warning) = result.warning {
+        if let Some(warning) = &result.warning {
             eprintln!("zk-lsp notes: warning: {warning}");
+        }
+        if let Some(fingerprint) = &result.fingerprint {
+            next_cache_records.insert(
+                result.id.clone(),
+                CachedNoteRecord {
+                    fingerprint: fingerprint.clone(),
+                    value: result.value.clone(),
+                    warning: result.warning.clone(),
+                },
+            );
         }
         records.push(result.value);
     }
+    NotesCache::save(cache_path, cache_context, next_cache_records).await;
 
     Ok(serde_json::to_string_pretty(&records)?)
 }
@@ -203,12 +229,33 @@ async fn build_note_record(
     path: &Path,
     config: &WikiConfig,
     metadata_snapshot: &metadata::MetadataSnapshot,
+    cached: Option<&CachedNoteRecord>,
 ) -> NoteRecordResult {
+    let initial_stat = tokio::fs::metadata(path).await.ok();
+    let initial_fingerprint = initial_stat
+        .as_ref()
+        .and_then(FileFingerprint::from_metadata);
+    if let (Some(cached), Some(fingerprint)) = (cached, &initial_fingerprint) {
+        if cached.fingerprint == *fingerprint {
+            return NoteRecordResult {
+                id: id.to_string(),
+                value: cached.value.clone(),
+                warning: cached.warning.clone(),
+                fingerprint: Some(fingerprint.clone()),
+            };
+        }
+    }
+
     let (content, stat) = match read_note_with_stat(path).await {
         Ok(result) => result,
         Err(err) => {
             let message = format!("reading {}: {err}", path.display());
-            return NoteRecordResult::warning(note_error_value(id, path, &message, None), message);
+            return NoteRecordResult::warning(
+                id,
+                note_error_value(id, path, &message, None),
+                message,
+                None,
+            );
         }
     };
 
@@ -217,8 +264,10 @@ async fn build_note_record(
         Err(err) => {
             let message = err.to_string();
             return NoteRecordResult::warning(
+                id,
                 note_error_value(id, path, &message, stat.as_ref()),
                 format!("{}: {message}", path.display()),
+                stat.as_ref().and_then(FileFingerprint::from_metadata),
             );
         }
     };
@@ -232,13 +281,19 @@ async fn build_note_record(
     ) {
         Ok(mut value) => {
             add_file_stat(&mut value, stat.as_ref());
-            NoteRecordResult::ok(value)
+            NoteRecordResult::ok(
+                id,
+                value,
+                stat.as_ref().and_then(FileFingerprint::from_metadata),
+            )
         }
         Err(err) => {
             let message = err.to_string();
             NoteRecordResult::warning(
+                id,
                 note_error_value(id, path, &message, stat.as_ref()),
                 format!("{}: {message}", path.display()),
+                stat.as_ref().and_then(FileFingerprint::from_metadata),
             )
         }
     }
@@ -264,22 +319,141 @@ async fn read_note_with_stat(path: &Path) -> anyhow::Result<(String, Option<std:
 }
 
 struct NoteRecordResult {
+    id: String,
+    value: serde_json::Value,
+    warning: Option<String>,
+    fingerprint: Option<FileFingerprint>,
+}
+
+impl NoteRecordResult {
+    fn ok(id: &str, value: serde_json::Value, fingerprint: Option<FileFingerprint>) -> Self {
+        Self {
+            id: id.to_string(),
+            value,
+            warning: None,
+            fingerprint,
+        }
+    }
+
+    fn warning(
+        id: &str,
+        value: serde_json::Value,
+        warning: String,
+        fingerprint: Option<FileFingerprint>,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            value,
+            warning: Some(warning),
+            fingerprint,
+        }
+    }
+}
+
+const NOTES_CACHE_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct FileFingerprint {
+    size: u64,
+    modified_nanos: u64,
+}
+
+impl FileFingerprint {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Option<Self> {
+        let nanos = metadata
+            .modified()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        Some(Self {
+            size: metadata.len(),
+            modified_nanos: nanos.min(u128::from(u64::MAX)) as u64,
+        })
+    }
+
+    async fn load(path: &Path) -> Option<Self> {
+        Self::from_metadata(&tokio::fs::metadata(path).await.ok()?)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct CacheContext {
+    metadata: Option<FileFingerprint>,
+    metadata_config_hash: u64,
+}
+
+impl CacheContext {
+    async fn load(config: &WikiConfig) -> Self {
+        let mut hasher = DefaultHasher::new();
+        for field in &config.zk_config.metadata.fields {
+            field.path.hash(&mut hasher);
+            format!("{:?}", field.kind).hash(&mut hasher);
+            field.default.to_string().hash(&mut hasher);
+        }
+        Self {
+            metadata: FileFingerprint::load(&metadata::metadata_path(&config.root)).await,
+            metadata_config_hash: hasher.finish(),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct CachedNoteRecord {
+    fingerprint: FileFingerprint,
     value: serde_json::Value,
     warning: Option<String>,
 }
 
-impl NoteRecordResult {
-    fn ok(value: serde_json::Value) -> Self {
-        Self {
-            value,
-            warning: None,
+#[derive(Deserialize, Serialize)]
+struct NotesCache {
+    version: u32,
+    context: CacheContext,
+    records: HashMap<String, CachedNoteRecord>,
+}
+
+impl NotesCache {
+    async fn load(path: &Path, context: &CacheContext) -> Self {
+        let loaded = match tokio::fs::read(path).await {
+            Ok(bytes) => serde_json::from_slice::<Self>(&bytes).ok(),
+            Err(_) => None,
+        };
+        match loaded {
+            Some(cache) if cache.version == NOTES_CACHE_VERSION && cache.context == *context => {
+                cache
+            }
+            _ => Self {
+                version: NOTES_CACHE_VERSION,
+                context: context.clone(),
+                records: HashMap::new(),
+            },
         }
     }
 
-    fn warning(value: serde_json::Value, warning: String) -> Self {
-        Self {
-            value,
-            warning: Some(warning),
+    async fn save(
+        path: PathBuf,
+        context: CacheContext,
+        records: HashMap<String, CachedNoteRecord>,
+    ) {
+        let cache = Self {
+            version: NOTES_CACHE_VERSION,
+            context,
+            records,
+        };
+        let Ok(bytes) = serde_json::to_vec(&cache) else {
+            return;
+        };
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if tokio::fs::create_dir_all(parent).await.is_err() {
+            return;
+        }
+        let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+        if tokio::fs::write(&temp, bytes).await.is_ok()
+            && tokio::fs::rename(&temp, &path).await.is_err()
+        {
+            let _ = tokio::fs::remove_file(&temp).await;
         }
     }
 }
@@ -581,5 +755,42 @@ default = "normal"
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[1]["id"], "2222222222");
         assert!(arr[1]["error"].as_str().unwrap().contains("parsing"));
+    }
+
+    #[tokio::test]
+    async fn notes_json_cache_invalidates_changed_notes_and_metadata() {
+        let root = make_test_root("cache_invalidation");
+        write_note(&root, "1111111111", "First", "");
+        let config = WikiConfig::from_root(root.clone());
+
+        let first = build_notes_json(&config).await.unwrap();
+        assert!(root.join(".zk-lsp/notes-v1.json").is_file());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first).unwrap()[0]["title"],
+            "First"
+        );
+
+        let note_path = root.join("note/1111111111.typ");
+        let changed = fs::read_to_string(&note_path)
+            .unwrap()
+            .replace("= First <", "= A longer second title <");
+        fs::write(&note_path, changed).unwrap();
+        let second = build_notes_json(&config).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&second).unwrap()[0]["title"],
+            "A longer second title"
+        );
+
+        let metadata_path = root.join("metadata.toml");
+        let changed = fs::read_to_string(&metadata_path)
+            .unwrap()
+            .replace("relation = \"active\"", "relation = \"archived\"");
+        fs::write(metadata_path, changed).unwrap();
+        let third = build_notes_json(&config).await.unwrap();
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&third).unwrap()[0]["metadata"]["relation"],
+            "archived"
+        );
     }
 }

@@ -258,6 +258,11 @@ zk-lsp config metadata defaults --toml
 zk-lsp config metadata json-schema --json
 ```
 
+`notes` keeps a disposable incremental cache at `.zk-lsp/notes-v1.json` inside
+the wiki root. Cache entries are invalidated when a note, `metadata.toml`, or
+the loaded metadata field configuration changes. The `.zk-lsp/` directory is
+generated state and should be ignored by version control.
+
 ### Metadata record commands
 
 `zk-lsp metadata` operates on one note's metadata record in `metadata.toml`.
